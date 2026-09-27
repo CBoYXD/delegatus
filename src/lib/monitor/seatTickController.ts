@@ -1,4 +1,5 @@
 import crypto from "node:crypto";
+import path from "node:path";
 
 import { yieldToRuntime } from "@/lib/cooperative";
 import { SeatTickAccounting } from "./seatTickAccounting";
@@ -26,6 +27,7 @@ import {
 import { openIssuesForProposal, type ProposalIssue } from "./githubEvidence";
 import { appendSeatTickRecord } from "./journalStore";
 import { redactBounded, redactMonitorText } from "./redact";
+import { seatMcpHealth, type SeatMcpHealth } from "./seatMcpHealth";
 import { withChildFinalMessages } from "./childFinalMessage";
 import { seatTickNoteRevision, seatTickProposalMessage, seatTickWakeMessage } from "./report";
 import { SEAT_TICK_WAKE_INTERVAL_MS, seatTickDecision, seatTickPolicy, seatTickWakeCommit, seatTickWakeCommitPlan } from "./seatTick";
@@ -127,6 +129,8 @@ export interface SeatTickControllerDependencies {
       on, before the check reads a seat (#1757). See
       {@link reconcileProvisionalSeat}. */
   reconcileSeat?: (project: string) => Promise<StillbornSeatRollback | null> | StillbornSeatRollback | null;
+  /** Override the stdio MCP heartbeat read in a focused controller test. */
+  mcpHealth?: (conversationId: string, designatedAt: string | null, now: number) => SeatMcpHealth;
 }
 
 /**
@@ -219,6 +223,14 @@ function absorbedAttempts(existing: BoardTask | undefined, key: string): number 
 
 function cardText(project: string, card: SeatTickCard, at: string, existing?: BoardTask): string {
   if (card.kind === "no-seat") return orchestratorAlertCardText(card.detail, at);
+  if (card.kind === "mcp-unavailable") return redactBounded([
+    "Orchestrator seat cannot use its Viewer MCP",
+    "",
+    `${card.detail}. Seat tick is withholding further wakes from this seat. Rotate the seat to restore its Viewer tools.`,
+    `Project ${project}.`,
+    "",
+    `${MONITOR_REF_PREFIX} ${card.ref}`,
+  ].join("\n"), CARD_TEXT_LIMIT);
   if (card.kind === "source-unreadable") {
     return card.ref === seatTickSourceGapRef("children")
       ? seatTickChildrenGapCardText(project, card.detail, card.ref, at)
@@ -309,14 +321,29 @@ function ensureSeatTickCard(project: string, card: SeatTickCard, at: string): bo
         /* The condition is on the board either way; only its wording is stale. */
         : unchanged;
     }
+    if (card.kind === "mcp-unavailable" && card.state === "open") {
+      /* A recovered outage has a completed card and a durable create receipt.
+         Reopen that project's card on a later outage of the same seat: creating
+         with the old receipt would replay the completed task instead. */
+      const completed = state.tasks.findLast((task) =>
+        canonicalOrchestratorProject(task.project) === project
+        && task.status === "done"
+        && monitorRefIn(task.text) === card.ref);
+      if (completed) {
+        const reopened = patchTask(state.tasks, completed.id, { status: "inbox", text });
+        return reopened.ok
+          ? { state: { tasks: reopened.tasks, recentCreates: state.recentCreates }, result: true }
+          : { state: absorbed ? state : undefined, result: false };
+      }
+    }
     const created = createTask(state.tasks, {
       project,
       text,
       placement: "unplaced",
-      /* The occurrence, not just the condition (#1298). Without it the second
-         outage of a source replays the first outage's receipt and creates no
-         card at all, once the first has been completed. */
-      clientRequestId: monitorClientRequestId(card.instance ? `${card.ref}:${card.instance}` : card.ref),
+      /* Scope the receipt to the project, then to the occurrence where one is
+         known (#1298). A repeated MCP outage reopens its completed card above. */
+      clientRequestId: monitorClientRequestId(card.instance
+        ? `${card.ref}:${project}:${card.instance}` : `${card.ref}:${project}`),
     }, state.recentCreates);
     if (!created.ok) return { state: absorbed ? state : undefined, result: false };
     if (created.replay) return unchanged;
@@ -903,6 +930,8 @@ async function reconcileOutstandingWake(context: {
   /** The transport, for the same-key re-dispatch. Absent means this reconcile
       never re-dispatches — the one that follows a send in the same check. */
   deliver?: typeof deliverConversationMessage;
+  /** Recheck the seat's MCP immediately before a same-key dispatch. */
+  mayDispatch?: () => boolean;
   /** When the project's tick settings were last written, which a refusal run
       is counted against. Only the re-dispatching reconcile needs it. */
   settingsUpdatedAt?: string | null;
@@ -1002,6 +1031,7 @@ async function reconcileOutstandingWake(context: {
     const authority = context.sources.seatFor(context.project).active;
     if (held.outstandingWake?.clientMessageId !== wake.clientMessageId) return held;
     if (!authority || authority.conversationId !== wake.conversationId || authority.seatEpoch !== wake.seatEpoch) return state;
+    if (context.mayDispatch?.() === false) return state;
     const accounting = state.accounting ? new SeatTickAccounting(state.accounting.filename, context.project) : null;
     if (!accounting) return state;
     const token = accounting.beginDispatch(wake);
@@ -1213,6 +1243,15 @@ async function check(
   const writeState = dependencies.writeState ?? writeSeatTickState;
   const deliver = dependencies.deliver ?? deliverConversationMessage;
   const ensureCard = dependencies.ensureCard ?? ensureSeatTickCard;
+  const mcpHealthFor = (seat: { conversationId: string; designatedAt?: string | null }, now: number): SeatMcpHealth & { transport?: "stdio" | "http" } => {
+    try {
+      const receipt = sources.registry().seatMcpReceipt?.(seat.conversationId) ?? null;
+      const health = dependencies.mcpHealth?.(seat.conversationId, seat.designatedAt ?? null, now)
+        ?? seatMcpHealth(receipt, seat.designatedAt ?? null,
+          path.dirname(statePath("mcp-runtime")), now, receipt?.viewerMcpTransport ?? "stdio");
+      return { ...health, ...(receipt?.viewerMcpTransport ? { transport: receipt.viewerMcpTransport } : {}) };
+    } catch { return { status: "untracked", detail: "MCP liveness could not be read" }; }
+  };
 
   /* BEFORE A SEAT IS READ AT ALL (#1757): converge the active seat with the
      launch it was activated on, so this check opens on the seat the operator
@@ -1268,6 +1307,7 @@ async function check(
     writeState,
     unresolved,
     deliver,
+    mayDispatch: () => !openingSeat?.conversationId || mcpHealthFor({ ...openingSeat, conversationId: openingSeat.conversationId }, sources.now()).status !== "dead",
     settingsUpdatedAt: settingsUpdatedAtFor(canonical, sources),
     at: new Date(opening).toISOString(),
     now: opening,
@@ -1283,6 +1323,18 @@ async function check(
      from `settled` here would drop the seal and read the whole journal as
      unread again at the next check. */
   const input = { ...gathered, state: seatTickStateForEpoch(gathered.state, gathered.seat?.seatEpoch ?? null) };
+  const mcpHealth = input.seat ? mcpHealthFor(input.seat, input.now) : null;
+  if (input.seat && (mcpHealth?.status !== "untracked" || mcpHealth.transport === "http")) {
+    try {
+      ensureCard(input.project, {
+        ref: "seat-viewer-mcp-unavailable", kind: "mcp-unavailable",
+        detail: mcpHealth!.detail, state: mcpHealth!.status === "dead" ? "open" : "resolved",
+        instance: String(input.seat.seatEpoch),
+      }, new Date(input.now).toISOString());
+    } catch (error) {
+      console.error("[seat tick] MCP health card write failed", error instanceof Error ? error.name : "unknown");
+    }
+  }
   /* Every settled deploy gets its board snapshot before anything is decided
      or sent (docs/design/orchestrator-reports.md §3.8), so a deploy first seen
      by the check that announces it already has one when the seat reports. It
@@ -1437,6 +1489,9 @@ async function check(
     const refusals = seatTickActiveRefusalRun(state, refusalBasis(input.seat.seatEpoch, state, input.settings.updatedAt));
     if (rotated) {
       delivery = { clientMessageId, outcome: "seat-rotated" };
+    } else if (mcpHealth?.status === "dead") {
+      delivery = { clientMessageId, outcome: "seat-mcp-unavailable" };
+      fenceDetail = `${mcpHealth.detail}; rotate the seat`;
     } else if (withheld) {
       delivery = { clientMessageId, outcome: "deferred-outstanding" };
       fenceDetail = seatTickFenceSentence(fence!);

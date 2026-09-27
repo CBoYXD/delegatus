@@ -230,6 +230,8 @@ export interface SpawnReceipt {
   admissionOwner: ProcessIdentity | null;
   /** One-way binding for the caller credential injected into this worker. */
   spawnCapabilityDigest: string | null;
+  /** Viewer MCP transport selected for this launch, after HTTP admission. */
+  viewerMcpTransport?: "stdio" | "http" | null;
   /** Reserved at receipt birth so path discovery cannot choose the identity. */
   conversationId: ViewerConversationId;
   purpose: "launch" | "migration-successor" | "resume-successor";
@@ -3557,6 +3559,8 @@ function normalizeReceipt(value: SpawnReceipt, policy?: McpGrantPolicy): SpawnRe
     spawnCapabilityDigest: typeof value.spawnCapabilityDigest === "string" && /^[0-9a-f]{64}$/.test(value.spawnCapabilityDigest)
       ? value.spawnCapabilityDigest
       : null,
+    viewerMcpTransport: value.viewerMcpTransport === "http" || value.viewerMcpTransport === "stdio"
+      ? value.viewerMcpTransport : null,
     conversationId: typeof value.conversationId === "string" && value.conversationId.startsWith("conversation_")
       ? value.conversationId as ViewerConversationId
       : `conversation_${crypto.randomUUID()}`,
@@ -5100,6 +5104,29 @@ export class AgentRegistry {
     return conversation ? { id: conversation.id, turn: conversation.turn } : null;
   }
 
+  /** Current credential identity for the seat's stdio MCP heartbeat. */
+  seatMcpReceipt(conversationId: string): { spawnCapabilityDigest: string; createdAt: string; viewerMcpTransport: "stdio" | "http" | null } | null {
+    if (this.sqliteStore && (this.sqliteMode === "sqlite" || this.sqliteMode === "read")) {
+      return this.sqliteStore.seatMcpReceipt(conversationId);
+    }
+    const receipt = Object.values(this.readOnlySnapshot().receipts)
+      .filter((candidate) => candidate.conversationId === conversationId && candidate.spawnCapabilityDigest)
+      .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
+    return receipt?.spawnCapabilityDigest
+      ? { spawnCapabilityDigest: receipt.spawnCapabilityDigest, createdAt: receipt.createdAt,
+          viewerMcpTransport: receipt.viewerMcpTransport ?? null }
+      : null;
+  }
+
+  /** Bind the effective MCP transport before the engine reads its config. */
+  setReceiptViewerMcpTransport(launchId: string, transport: "stdio" | "http"): void {
+    this.mutate((file) => {
+      const receipt = file.receipts[launchId];
+      if (!receipt) throw new Error("spawn receipt is missing");
+      receipt.viewerMcpTransport = transport;
+    });
+  }
+
   /** Resolves only conversation ids already present in the bounded custom-title
       store. JSON compatibility mode deliberately stays registry-free on the
       snapshot route; UUID/path title keys still apply there. */
@@ -5438,6 +5465,7 @@ export class AgentRegistry {
         spawnCapabilityDigest: typeof input.spawnCapabilityDigest === "string" && /^[0-9a-f]{64}$/.test(input.spawnCapabilityDigest)
           ? input.spawnCapabilityDigest
           : null,
+        viewerMcpTransport: null,
         conversationId: conversationId ?? `conversation_${crypto.randomUUID()}`,
         purpose: input.purpose ?? "launch",
         supersedes: supersedes ? { conversationId: supersedes, reason: input.supersedesReason ?? "recovery-spawn" } : null,

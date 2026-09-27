@@ -2,6 +2,8 @@ import { afterAll, afterEach, expect, spyOn, test } from "bun:test";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { spawn } from "node:child_process";
 import { Database } from "bun:sqlite";
 
 const SANDBOX = fs.mkdtempSync(path.join(os.tmpdir(), "llv-seat-tick-controller-"));
@@ -25,6 +27,8 @@ fs.mkdirSync(SESSIONS, { recursive: true });
 const { SEAT_TICK_NO_SELF_SCHEDULE } = await import("./report");
 const { reconcileSeatTick, runSeatTickCheck, SEAT_TICK_WAKE_UNRESOLVED_REF, startSeatTick, stopSeatTick, wakeReached } = await import("./seatTickController");
 const { DEFAULT_SEAT_TICK_POLICY } = await import("./seatTick");
+const { seatMcpHealth } = await import("./seatMcpHealth");
+const { viewerMcpTransportForLaunch } = await import("@/lib/agent/spawnPolicy");
 const { defaultSeatTickSettings } = await import("./seatTickSettings");
 const { openPullRequestsForRepo } = await import("./githubEvidence");
 const { defaultSeatTickSources, journalReceipt, settleRecordFromJournal, wakeStateFromRecord } = await import("./seatTickSources");
@@ -275,6 +279,7 @@ function harness(options: {
           return {
             pageSeatChildren: registry.pageSeatChildren.bind(registry),
             seatTickConversation: registry.seatTickConversation.bind(registry),
+            seatMcpReceipt: registry.seatMcpReceipt.bind(registry),
             conversation: (id: string) => registry.conversation(id as never),
             conversationForPath: (artifactPath: string) => registry.conversationForPath(artifactPath),
             readOnlySnapshot: () => { result.snapshots += 1; return registry.readOnlySnapshot(); },
@@ -629,6 +634,246 @@ test("a wake is delivered by durable conversation id, with an idempotent client 
   expect(rig.written.at(-1)!.lastWakeAt).toBe(new Date(NOW).toISOString());
 });
 
+test("a seat whose stdio Viewer MCP is dead is carded and receives no more tick wakes", async () => {
+  const rig = harness({ pipelines: OPEN_LANE, state: OVERDUE });
+  const record = await runSeatTickCheck(PROJECT, {
+    ...rig.deps,
+    mcpHealth: () => ({ status: "dead", detail: "the session's stdio MCP launcher stopped reporting liveness" }),
+  });
+  expect(rig.sent).toHaveLength(0);
+  expect(record?.delivery?.outcome).toBe("seat-mcp-unavailable");
+  expect(rig.cards).toContainEqual({ project: PROJECT, card: expect.objectContaining({
+    kind: "mcp-unavailable", ref: "seat-viewer-mcp-unavailable", state: "open", instance: "7",
+  }) });
+  expect(rig.written.at(-1)?.lastWakeAt).toBe(OVERDUE.lastWakeAt);
+});
+
+test("persisted MCP cards survive repeated outages and equal-epoch projects", async () => {
+  const previous = process.env.LLV_STATE_DIR;
+  process.env.LLV_STATE_DIR = fs.mkdtempSync(path.join(SANDBOX, "mcp-board-outages-"));
+  try {
+    const { loadTasks } = await import("@/lib/tasks/store");
+    const projectA = "mcp-board-a";
+    const projectB = "mcp-board-b";
+    const rig = harness({ pipelines: OPEN_LANE, state: OVERDUE });
+    const health = { status: "dead" as const, detail: "stdio MCP has no heartbeat" };
+    const deps = { ...rig.deps, ensureCard: undefined, mcpHealth: () => health };
+    const cards = (project: string) => loadTasks(statePath("tasks.json")).filter((task) =>
+      task.project === project && task.text.includes("monitor-ref: seat-viewer-mcp-unavailable"));
+
+    expect((await runSeatTickCheck(projectA, deps))?.delivery?.outcome).toBe("seat-mcp-unavailable");
+    expect((await runSeatTickCheck(projectB, deps))?.delivery?.outcome).toBe("seat-mcp-unavailable");
+    expect(cards(projectA).filter((task) => task.status !== "done")).toHaveLength(1);
+    expect(cards(projectB).filter((task) => task.status !== "done")).toHaveLength(1);
+    await runSeatTickCheck(projectA, deps);
+    expect(cards(projectA)).toHaveLength(1);
+
+    await runSeatTickCheck(projectA, { ...deps, mcpHealth: () => ({ status: "healthy", detail: "stdio MCP is live" }) });
+    expect(cards(projectA)[0]?.status).toBe("done");
+    await runSeatTickCheck(projectA, deps);
+    expect(cards(projectA).filter((task) => task.status !== "done")).toHaveLength(1);
+    expect(cards(projectB).filter((task) => task.status !== "done")).toHaveLength(1);
+  } finally {
+    if (previous === undefined) delete process.env.LLV_STATE_DIR;
+    else process.env.LLV_STATE_DIR = previous;
+  }
+});
+
+test("an HTTP successor closes the predecessor's persisted MCP alert and receives wakes", async () => {
+  const previous = process.env.LLV_STATE_DIR;
+  process.env.LLV_STATE_DIR = fs.mkdtempSync(path.join(SANDBOX, "mcp-board-http-"));
+  try {
+    const { loadTasks } = await import("@/lib/tasks/store");
+    const options = { pipelines: OPEN_LANE, state: OVERDUE, now: NOW };
+    const rig = harness(options);
+    const sources = rig.deps.sources!;
+    const deps = {
+      ...rig.deps,
+      ensureCard: undefined,
+      sources: { ...sources, registry: () => ({ ...sources.registry(), seatMcpReceipt: (id: string) => id === SUCCESSOR
+        ? { spawnCapabilityDigest: "a".repeat(64), createdAt: new Date(NOW).toISOString(), viewerMcpTransport: "http" as const }
+        : { spawnCapabilityDigest: "b".repeat(64), createdAt: new Date(NOW - 30 * MINUTE).toISOString(), viewerMcpTransport: "stdio" as const } } as never) },
+    };
+    const cards = () => loadTasks(statePath("tasks.json")).filter((task) =>
+      task.project === PROJECT && task.text.includes("monitor-ref: seat-viewer-mcp-unavailable"));
+
+    expect((await runSeatTickCheck(PROJECT, deps))?.delivery?.outcome).toBe("seat-mcp-unavailable");
+    expect(cards().filter((task) => task.status !== "done")).toHaveLength(1);
+    await runSeatTickCheck(PROJECT, { ...deps, mcpHealth: () => ({ status: "untracked", detail: "MCP liveness could not be read" }) });
+    expect(cards().filter((task) => task.status !== "done")).toHaveLength(1);
+
+    rig.seat = { conversationId: SUCCESSOR, seatEpoch: 8, path: null };
+    options.now = NOW + 120 * MINUTE;
+    expect((await runSeatTickCheck(PROJECT, deps))?.delivery?.outcome).toBe("delivered");
+    expect(rig.sent).toHaveLength(2);
+    expect(rig.sent.at(-1)?.conversationId).toBe(SUCCESSOR);
+    expect(cards()).toHaveLength(1);
+    expect(cards()[0]?.status).toBe("done");
+  } finally {
+    if (previous === undefined) delete process.env.LLV_STATE_DIR;
+    else process.env.LLV_STATE_DIR = previous;
+  }
+});
+
+test("transport failure opens the MCP card and recovery closes it before wakes resume", async () => {
+  const rig = harness({ pipelines: OPEN_LANE, state: OVERDUE });
+  const stateDir = fs.mkdtempSync(path.join(SANDBOX, "mcp-card-"));
+  const digest = "c".repeat(64);
+  const heartbeatFile = path.join(stateDir, "mcp-runtime", "sessions", `${digest}.json`);
+  fs.mkdirSync(path.dirname(heartbeatFile), { recursive: true });
+  const receipt = { spawnCapabilityDigest: digest, createdAt: new Date(NOW - 30 * MINUTE).toISOString() };
+  const designatedAt = new Date(NOW - 20 * MINUTE).toISOString();
+  const write = (failedCalls: number) => fs.writeFileSync(heartbeatFile, JSON.stringify({
+    checkedAt: new Date(NOW).toISOString(), ready: true, unreadySince: null, failedCalls,
+  }));
+  const deps = { ...rig.deps, mcpHealth: () => seatMcpHealth(receipt, designatedAt, stateDir, NOW) };
+  write(3);
+  expect((await runSeatTickCheck(PROJECT, deps))?.delivery?.outcome).toBe("seat-mcp-unavailable");
+  expect(rig.sent).toHaveLength(0);
+  expect(rig.cards.at(-1)?.card).toMatchObject({ kind: "mcp-unavailable", state: "open" });
+  write(0);
+  await runSeatTickCheck(PROJECT, deps);
+  expect(rig.cards.at(-1)?.card).toMatchObject({ kind: "mcp-unavailable", state: "resolved" });
+  expect(rig.sent).toHaveLength(1);
+});
+
+test("seat MCP health follows its recorded launch transport across server flag changes", async () => {
+  const prior = process.env.LLV_MCP_TRANSPORT;
+  try {
+    for (const { selected, current, blocked, requestedHttp, legacy } of [
+      { selected: "stdio", current: "http", blocked: true, requestedHttp: false, legacy: false },
+      { selected: "http", current: "stdio", blocked: false, requestedHttp: false, legacy: false },
+      /* HTTP requested at admission but rejected by the capability or local
+         endpoint gate: the actual launch remains stdio. */
+      { selected: "stdio", current: "http", blocked: true, requestedHttp: true, legacy: false },
+      { selected: "stdio", current: "http", blocked: true, requestedHttp: false, legacy: true },
+    ] as const) {
+      const fixture = childFixture(`mcp-transport-${selected}-${current}-${crypto.randomUUID()}`);
+      const digest = createHash("sha256").update(crypto.randomUUID()).digest("hex");
+      const begun = fixture.registry.beginSpawnRequest({ engine: "claude", cwd: fixture.cwd,
+        conversationId: fixture.seat.conversationId as never, spawnCapabilityDigest: digest,
+        launchProfile: { title: "Seat transport" } });
+      const launched = requestedHttp
+        ? viewerMcpTransportForLaunch({ LLV_SPAWN_CAPABILITY: "c".repeat(43) }, {
+            LLV_MCP_TRANSPORT: "http", LLV_TOKEN: "test-key", LLV_MCP_HTTP_URL: "http://127.0.0.1:41234/api/mcp",
+          })
+        : selected;
+      expect(launched).toBe(selected);
+      if (!legacy) fixture.registry.setReceiptViewerMcpTransport(begun.receipt.launchId, launched);
+      fixture.spawn({ title: "owed worker", turn: "terminal" });
+      fixture.seed();
+      process.env.LLV_MCP_TRANSPORT = current;
+      const seat = { ...fixture.seat, designatedAt: ago(fixture, 20) };
+      const rig = childRig(fixture, { seat });
+      const record = await runSeatTickCheck(fixture.project, rig.deps);
+      expect(rig.sent).toHaveLength(blocked ? 0 : 1);
+      expect(record?.delivery?.outcome).toBe(blocked ? "seat-mcp-unavailable" : "delivered");
+      expect(rig.cards.some(({ card }) => card.kind === "mcp-unavailable" && card.state === "open")).toBe(blocked);
+    }
+  } finally {
+    if (prior === undefined) delete process.env.LLV_MCP_TRANSPORT;
+    else process.env.LLV_MCP_TRANSPORT = prior;
+  }
+});
+
+test("repeated real launcher child crashes block seat wakes until a tool response proves recovery", async () => {
+  const node = Bun.which("node");
+  if (!node) throw new Error("Node is required for the launcher test");
+  const packageRoot = fs.mkdtempSync(path.join(SANDBOX, "mcp-launcher-"));
+  const bin = path.join(packageRoot, "bin");
+  const dist = path.join(packageRoot, "dist");
+  fs.mkdirSync(bin);
+  fs.mkdirSync(dist);
+  for (const name of ["mcp-server.mjs", "server-runtime.mjs", "appDir.mjs", "envAlias.mjs"]) {
+    fs.copyFileSync(path.join(import.meta.dir, "../../../bin", name), path.join(bin, name));
+  }
+  const crashFlag = path.join(packageRoot, "crash.flag");
+  fs.writeFileSync(crashFlag, "crash");
+  fs.writeFileSync(path.join(dist, "mcp-server.mjs"), `
+    const fs = await import("node:fs");
+    let input = "";
+    process.stdin.setEncoding("utf8");
+    process.stdin.on("data", chunk => {
+      input += chunk;
+      while (input.includes("\\n")) {
+        const at = input.indexOf("\\n");
+        const request = JSON.parse(input.slice(0, at)); input = input.slice(at + 1);
+        if (request.id === undefined) continue;
+        if (request.method === "tools/call" && fs.existsSync(process.env.LLV_TEST_CRASH_FLAG)) process.exit(7);
+        const result = request.method === "initialize"
+          ? { protocolVersion: "2025-03-26", capabilities: { tools: {} }, serverInfo: { name: "viewer", version: "1" } }
+          : request.method === "tools/list"
+            ? { tools: [{ name: "check", inputSchema: { type: "object" } }] }
+            : { content: [{ type: "text", text: "recovered" }] };
+        process.stdout.write(JSON.stringify({ jsonrpc: "2.0", id: request.id, result }) + "\\n");
+      }
+    });
+  `);
+  const stateDir = path.join(packageRoot, "state");
+  const capability = "D".repeat(43);
+  const digest = createHash("sha256").update(capability).digest("hex");
+  const heartbeatFile = path.join(stateDir, "mcp-runtime", "sessions", `${digest}.json`);
+  const session = spawn(node, [path.join(bin, "mcp-server.mjs")], {
+    cwd: packageRoot,
+    env: { ...process.env, LLV_STATE_DIR: stateDir, LLV_SPAWN_CAPABILITY: capability,
+      LLV_BUN_EXECUTABLE: process.execPath, LLV_TEST_CRASH_FLAG: crashFlag },
+    stdio: ["pipe", "pipe", "pipe"],
+  });
+  const pendingResponses = new Map<number, (message: any) => void>();
+  let output = "";
+  session.stdout.setEncoding("utf8");
+  session.stdout.on("data", (chunk: string) => {
+    output += chunk;
+    while (output.includes("\n")) {
+      const at = output.indexOf("\n");
+      const message = JSON.parse(output.slice(0, at)); output = output.slice(at + 1);
+      if (pendingResponses.has(message.id)) {
+        pendingResponses.get(message.id)!(message);
+        pendingResponses.delete(message.id);
+      }
+    }
+  });
+  const call = (id: number, method: string) => new Promise<any>((resolve, reject) => {
+    const timeout = setTimeout(() => { pendingResponses.delete(id); reject(new Error(`MCP response ${id} timed out`)); }, 5_000);
+    pendingResponses.set(id, (message) => { clearTimeout(timeout); resolve(message); });
+    session.stdin.write(JSON.stringify({ jsonrpc: "2.0", id, method, params: { name: "check", arguments: {} } }) + "\n");
+  });
+  const readyHeartbeat = async () => {
+    const deadline = Date.now() + 5_000;
+    while (Date.now() < deadline) {
+      if (fs.existsSync(heartbeatFile) && JSON.parse(fs.readFileSync(heartbeatFile, "utf8")).ready === true) return;
+      await Bun.sleep(20);
+    }
+    throw new Error("MCP child did not reinitialize");
+  };
+  const rig = harness({ pipelines: OPEN_LANE, state: OVERDUE });
+  const receipt = { spawnCapabilityDigest: digest, createdAt: new Date(Date.now() - 30 * MINUTE).toISOString() };
+  const designatedAt = new Date(Date.now() - 20 * MINUTE).toISOString();
+  const deps = { ...rig.deps, mcpHealth: () => seatMcpHealth(receipt, designatedAt, stateDir, Date.now()) };
+  try {
+    expect((await call(1, "initialize")).result.serverInfo.name).toBe("viewer");
+    for (let id = 2; id <= 4; id++) {
+      await readyHeartbeat();
+      expect((await call(id, "tools/call")).result.isError).toBe(true);
+      expect(JSON.parse(fs.readFileSync(heartbeatFile, "utf8")).failedCalls).toBe(id - 1);
+    }
+    await readyHeartbeat();
+    expect(seatMcpHealth(receipt, designatedAt, stateDir, Date.now()).status).toBe("dead");
+    expect((await runSeatTickCheck(PROJECT, deps))?.delivery?.outcome).toBe("seat-mcp-unavailable");
+    expect(rig.sent).toHaveLength(0);
+    expect(rig.cards.at(-1)?.card).toMatchObject({ kind: "mcp-unavailable", state: "open" });
+    fs.unlinkSync(crashFlag);
+    expect((await call(5, "tools/call")).result.content[0].text).toBe("recovered");
+    expect(JSON.parse(fs.readFileSync(heartbeatFile, "utf8")).failedCalls).toBe(0);
+    await runSeatTickCheck(PROJECT, deps);
+    expect(rig.cards.at(-1)?.card).toMatchObject({ kind: "mcp-unavailable", state: "resolved" });
+    expect(rig.sent).toHaveLength(1);
+  } finally {
+    session.stdin.end();
+    if (session.exitCode === null) await new Promise<void>((resolve) => session.once("close", () => resolve()));
+  }
+}, 20_000);
+
 /* Two checks that found the same thing raise the same wake, so a re-send after
    a send that never landed is the replay the delivery layer treats it as —
    rather than a second copy of a message the seat may yet receive. */
@@ -819,7 +1064,9 @@ test("a wake the holder delivered after the send is credited with the plan that 
     state: { ...RECENT, eventsThrough: 12, outstandingWake: outstanding },
     wakeState: "landed",
   });
-  await runSeatTickCheck(PROJECT, rig.deps);
+  await runSeatTickCheck(PROJECT, { ...rig.deps,
+    mcpHealth: () => ({ status: "dead", detail: "stdio MCP has no heartbeat" }),
+  });
   const landing = rig.journal.find((line) => line.verdict === "landed")!;
   expect(landing.delivery).toEqual({ clientMessageId: outstanding.clientMessageId, outcome: "landed" });
   expect(rig.written.at(-1)!.lastWakeAt).toBe(new Date(NOW).toISOString());
@@ -3565,6 +3812,37 @@ test("a returned 409 or 503 refusal is fenced across rotation and the successor 
     expect(again.sent).toEqual([]);
     expect(fixture.acknowledged()).toEqual([child.id]);
   }
+});
+
+test("dead Viewer MCP withholds a recordless refusal retry under its original key until recovery", async () => {
+  const fixture = childFixture("mcp-refused-retry");
+  setAgentRegistryForTests(fixture.registry);
+  const child = fixture.spawn({ title: "owed worker", turn: "terminal" });
+  fixture.seed();
+  await runSeatTickCheck(fixture.project, childRig(fixture, {
+    realWakeState: true, deliverWith: refuseBeforeReservation(503),
+  }).deps);
+  const pending = fixture.row().outstandingWake!;
+  expect(pending).toMatchObject({ operationId: null, dispatch: { state: "refused" } });
+
+  const unavailable = childRig(fixture, { realWakeState: true, now: fixture.now + 5 * MINUTE });
+  const dead = await runSeatTickCheck(fixture.project, { ...unavailable.deps,
+    mcpHealth: () => ({ status: "dead", detail: "stdio MCP has no heartbeat" }),
+  });
+  expect(unavailable.sent).toEqual([]);
+  expect(dead?.delivery?.outcome).toBe("seat-mcp-unavailable");
+  expect(unavailable.cards.some(({ card }) => card.kind === "mcp-unavailable" && card.state === "open")).toBe(true);
+  expect(fixture.row().outstandingWake).toEqual(pending);
+  expect(fixture.acknowledged()).toEqual([]);
+
+  const recovered = childRig(fixture, { realWakeState: true, now: fixture.now + 10 * MINUTE });
+  await runSeatTickCheck(fixture.project, { ...recovered.deps,
+    mcpHealth: () => ({ status: "healthy", detail: "stdio MCP is live" }),
+  });
+  expect(recovered.sent).toHaveLength(1);
+  expect(recovered.sent[0]).toMatchObject({ clientMessageId: pending.clientMessageId, text: pending.text });
+  expect(fixture.acknowledged()).toEqual([child.id]);
+  expect(fixture.row().outstandingWake).toBeNull();
 });
 
 test("a paused old lookup cannot dispatch after a successor replaces the refused wake (#1465)", async () => {
