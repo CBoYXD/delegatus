@@ -14,6 +14,9 @@ import { laneMovedAt } from "@/lib/pipelines/laneMovement";
 import type { AgentRegistry as AgentRegistryType } from "@/lib/agent/registry";
 import { AccountMutationBusyError } from "@/lib/accounts/accountMutation";
 import { accountManager } from "@/lib/accounts/manager";
+import { selectProjectAccount } from "@/lib/accounts/projectSelection";
+import { forkClaudeHistory } from "@/lib/accounts/migration/safeHistoryCopy";
+import type { DurableQuotaObservation } from "@/lib/accounts/migration/contracts";
 
 process.env.LLV_STATE_DIR = fs.mkdtempSync(path.join(os.tmpdir(), "llv-pipeline-engine-"));
 const engineModule = await import("./engine");
@@ -157,6 +160,54 @@ test("a pipeline stage keeps its reserved account through a routing change befor
       launchProfile: expect.objectContaining({ title: "Build scoped change · build" }),
     });
     expect(settled.conversation).toMatchObject({ pinnedAccountId: "limited", migration: null });
+  } finally {
+    resolveSpawn.mockRestore();
+    setAgentRegistryForTests(null);
+  }
+});
+
+test("an automatically selected Claude stage remains eligible for ordinary conversation migration", async () => {
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "claude-stage-migration-registry.json"));
+  setAgentRegistryForTests(registry);
+  const resolveSpawn = spyOn(accountManager, "resolveProjectSpawn").mockImplementation(() => ({
+    kind: "available",
+    account: {
+      engine: "claude", accountId: "limited", kind: "managed",
+      home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" },
+    },
+  }));
+  try {
+    let launchId: string | null = null;
+    await expect(defaultPipelinePorts().spawnAgent({
+      role: {
+        roleId: "builder", engine: "claude", model: "fable", effort: "high",
+        access: "read-write", promptScaffold: "Builder guidance",
+      },
+      runtimeProfile: { access: "read-write", sandbox: "full" },
+      cwd: process.env.LLV_STATE_DIR!, project: "repo-00000000000000000000000000000001",
+      requestedAccountId: null, title: "Build scoped change · build", prompt: "Build",
+      parentPath: null, clientAttemptId: "claude_stage_migratable",
+      membership: {
+        kind: "pipeline", containerId: "claude-stage", role: "builder", slot: "build:1",
+        stageId: "build", stageOrder: 0, round: 1, parentConversationId: null,
+      },
+      creatorConversationId: null,
+    }, (reserved) => {
+      launchId = reserved.launchId;
+      throw new Error("reservation captured");
+    })).rejects.toThrow("reservation captured");
+    expect(launchId).not.toBeNull();
+    const receipt = registry.snapshot().receipts[launchId!]!;
+    expect(receipt).toMatchObject({ engine: "claude", accountId: "limited", accountPin: false });
+    const settled = registry.stageStructuredSpawn(receipt.launchId, {
+      key: { engine: "claude", sessionId: crypto.randomUUID() },
+      artifactPath: path.join(process.env.LLV_STATE_DIR!, "claude-stage-migratable.jsonl"),
+      cwd: process.env.LLV_STATE_DIR!, accountId: "limited", launchProfile: receipt.launchProfile,
+      status: "starting", host: null, structuredHost: null, claimEpoch: 0,
+      claimOwner: null, pendingAction: "spawn",
+    });
+    expect(settled.kind).toBe("settled");
+    if (settled.kind === "settled") expect(settled.conversation.pinnedAccountId).toBeNull();
   } finally {
     resolveSpawn.mockRestore();
     setAgentRegistryForTests(null);
@@ -8202,7 +8253,7 @@ function stageTranscript(name: string, records: Record<string, unknown>[]): stri
   return file;
 }
 
-function limitInterruptedTranscript(name: string): string {
+function limitInterruptedTranscript(name: string, notice = PROVIDER_LIMIT_NOTICE): string {
   return stageTranscript(name, [
     { type: "user", timestamp: "2026-08-27T09:00:00.000Z", message: { role: "user", content: "run the stage" } },
     {
@@ -8219,7 +8270,7 @@ function limitInterruptedTranscript(name: string): string {
         role: "assistant",
         model: "<synthetic>",
         stop_reason: "stop_sequence",
-        content: [{ type: "text", text: PROVIDER_LIMIT_NOTICE }],
+        content: [{ type: "text", text: notice }],
       },
     },
   ]);
@@ -8454,6 +8505,631 @@ test("an unpinned usage-limited stage respawns on another allowed account (#1371
   const failedOver = loadPipelines().find((candidate) => candidate.id === pipeline.id)!;
   expect(h.spawnInputs[1]).toMatchObject({ requestedAccountId: null, unavailableAccountIds: [LIMITED_ACCOUNT] });
   expect(failedOver.runs[0]!.attempts[1]).toMatchObject({ state: "running", accountId: SPARE_ACCOUNT });
+});
+
+test("a Claude session limit preserves dirty work, stage identity and review rounds through controller recovery", async () => {
+  const h = harness();
+  const root = fs.mkdtempSync(path.join(os.tmpdir(), "llv-claude-limit-work-"));
+  let repo = "";
+  const git = (...args: string[]) => {
+    const result = spawnSync("git", ["-C", repo, ...args], { encoding: "utf8" });
+    if (result.status !== 0) throw new Error(result.stderr);
+    return result.stdout;
+  };
+  try {
+    const pipeline = await create(h.ports, [
+      { ...usageLimitStage()[0], engine: "claude", model: "fable", next: "review" },
+      { id: "review", kind: "run", engine: "claude", model: "fable", access: "read-only", prompt: "Review", next: null, onFail: { to: "build", maxRounds: 3 } },
+    ] as never);
+    await tickPipelines([], h.ports);
+    await tickPipelines([], h.ports);
+    await tickPipelines([h.finish("/codex/stage-1.jsonl", "pass")], h.ports);
+    await tickPipelines([], h.ports);
+    await tickPipelines([h.finish("/codex/stage-2.jsonl", "fail")], h.ports);
+    await tickPipelines([], h.ports);
+    const before = loadPipelines().find((item) => item.id === pipeline.id)!;
+    before.repoDir = path.join(root, "repo");
+    repo = path.join(root, `repo-pipeline-${pipeline.id}`);
+    before.worktreeDir = repo;
+    const limited = before.runs.find((run) => run.stageId === "build")!.attempts[1]!;
+    limited.paneId = null;
+    savePipelines([before]);
+    const roundCount = edgeRoundsUsed(before, { from: "build", to: "review", kind: "pass" });
+    expect(roundCount).toBe(1);
+
+    fs.mkdirSync(repo);
+    git("init", "-q");
+    fs.writeFileSync(path.join(repo, "work.txt"), "before\n");
+    git("add", "work.txt");
+    git("-c", "user.name=Test", "-c", "user.email=fixture", "commit", "-qm", "baseline");
+    fs.writeFileSync(path.join(repo, "work.txt"), "unfinished Claude edit\n");
+    const dirtyDiff = git("diff", "--", "work.txt");
+    expect(dirtyDiff).toContain("unfinished Claude edit");
+    const successorPath = "/codex/stage-3-successor.jsonl";
+    const sourceId = "019f423a-d6e9-\x34903-b597-3e676b6ff3d4";
+    const forkId = "7d1c2b3a-4e5f-\x34a6b-8c7d-9e0f1a2b3c4d";
+    const sourceRoot = path.join(root, "claude-source");
+    const targetRoot = path.join(root, "claude-target");
+    fs.mkdirSync(sourceRoot);
+    fs.mkdirSync(targetRoot);
+    const sourcePath = path.join(sourceRoot, `${sourceId}.jsonl`);
+    const sourceFixture = limitInterruptedTranscript("claude-controller-session-limit", "You've hit your session limit · resets 2:30pm (Europe/Kyiv)");
+    fs.writeFileSync(sourcePath, fs.readFileSync(sourceFixture, "utf8").trimEnd().split("\n")
+      .map((line) => JSON.stringify({ ...JSON.parse(line), sessionId: sourceId })).join("\n") + "\n");
+    const fork = forkClaudeHistory({
+      sourcePath, sourceRoot, targetRoot, destination: path.join(targetRoot, `${forkId}.jsonl`),
+      sourceSessionId: sourceId, sessionId: forkId, operationId: "stage-limit-copy",
+    });
+    expect(fork.rewritten).toBeGreaterThan(0);
+    readFixtures(h, { "/codex/stage-3.jsonl": sourcePath, [successorPath]: fork.path });
+    usageLimitPorts(h, { kind: "available", account: {
+      engine: "claude", accountId: SPARE_ACCOUNT, kind: "managed",
+      home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" },
+    } });
+    let currentPath = "/codex/stage-3.jsonl";
+    const reseats: Array<{ conversationId: string; accountId: string }> = [];
+    const continuations: Array<{ conversationId: string; clientMessageId: string; path: string }> = [];
+    h.ports.requestConversationReseat = async (conversationId, accountId) => {
+      reseats.push({ conversationId, accountId });
+    };
+    h.ports.conversationMigration = () => reseats.length && currentPath !== successorPath
+      ? { targetId: SPARE_ACCOUNT, retry: false } : null;
+    h.ports.resumeSeveredTurn = async (input) => {
+      continuations.push({ conversationId: input.conversationId, clientMessageId: input.clientMessageId, path: input.transcriptPath });
+      return true;
+    };
+    h.ports.pathForConversation = (id) => id === limited.conversationId ? currentPath : null;
+    h.ports.accountForTranscript = (_engine, transcriptPath) => ({
+      accountId: transcriptPath === successorPath ? SPARE_ACCOUNT : LIMITED_ACCOUNT,
+      label: transcriptPath === successorPath ? SPARE_ACCOUNT_LABEL : LIMITED_ACCOUNT_LABEL,
+    });
+
+    await tickPipelines([], h.ports);
+    const switching = loadPipelines().find((item) => item.id === pipeline.id)!;
+    expect(switching.cursor).toMatchObject({ stageId: "build", state: "running" });
+    expect(switching.runs.find((run) => run.stageId === "build")!.attempts).toHaveLength(2);
+    expect(switching.runs.find((run) => run.stageId === "build")!.attempts[1]).toMatchObject({
+      state: "running", conversationId: limited.conversationId,
+      usageLimitedAccounts: [{ accountId: LIMITED_ACCOUNT, engine: "claude", resetsAt: null }],
+    });
+    expect(reseats).toEqual([{ conversationId: limited.conversationId!, accountId: SPARE_ACCOUNT }]);
+    expect(continuations).toHaveLength(1);
+    expect(switching.runs.find((run) => run.stageId === "review")!.attempts).toHaveLength(1);
+    expect(edgeRoundsUsed(switching, { from: "build", to: "review", kind: "pass" })).toBe(roundCount);
+    expect(git("diff", "--", "work.txt")).toBe(dirtyDiff);
+
+    h.ports.resolveProjectSpawn = () => ({ kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT, SPARE_ACCOUNT] });
+    await tickPipelines([], h.ports);
+    const migrating = loadPipelines().find((item) => item.id === pipeline.id)!;
+    expect(migrating.state).toBe("running");
+    expect(migrating.runs.find((run) => run.stageId === "build")!.attempts).toHaveLength(2);
+    expect(reseats).toHaveLength(1);
+
+    currentPath = successorPath;
+    await tickPipelines([], h.ports);
+    const resumed = loadPipelines().find((item) => item.id === pipeline.id)!;
+    expect(resumed.id).toBe(pipeline.id);
+    expect(resumed.branch).toBe(pipeline.branch);
+    expect(resumed.runs.find((run) => run.stageId === "build")!.attempts).toHaveLength(2);
+    expect(resumed.runs.find((run) => run.stageId === "build")!.attempts[1]).toMatchObject({
+      state: "running", conversationId: limited.conversationId, agentPath: successorPath, accountId: SPARE_ACCOUNT,
+    });
+    expect(resumed.runs.find((run) => run.stageId === "build")!.attempts[1]!.usageLimitedAccounts).toEqual(
+      switching.runs.find((run) => run.stageId === "build")!.attempts[1]!.usageLimitedAccounts,
+    );
+    expect(resumed.state).toBe("running");
+    expect(h.spawnInputs).toHaveLength(3);
+    expect(continuations.every((item) => item.conversationId === limited.conversationId
+      && item.clientMessageId === continuations[0]!.clientMessageId)).toBe(true);
+    expect(edgeRoundsUsed(resumed, { from: "build", to: "review", kind: "pass" })).toBe(roundCount);
+    expect(git("diff", "--", "work.txt")).toBe(dirtyDiff);
+    expect(h.calls.some((call) => /\b(?:reset|clean)\b/.test(call))).toBe(false);
+  } finally {
+    fs.rmSync(root, { recursive: true, force: true });
+  }
+});
+
+test("a Claude stage parks without a free allowed account and resumes its conversation when capacity returns", async () => {
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines().find((item) => item.id === pipeline.id)!;
+  const attempt = running.runs[0]!.attempts[0]!;
+  attempt.paneId = null;
+  savePipelines([running]);
+  readFixtures(h, { "/codex/stage-1.jsonl": limitInterruptedTranscript("claude-no-capacity") });
+  usageLimitPorts(h, { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT, SPARE_ACCOUNT] });
+
+  await tickPipelines([], h.ports);
+  const parked = loadPipelines().find((item) => item.id === pipeline.id)!;
+  expect(parked).toMatchObject({ state: "needs_decision", stateDetail: `rate limited until an unknown reset time, account ${LIMITED_ACCOUNT_LABEL}` });
+  expect(parked.runs[0]!.attempts).toHaveLength(1);
+  expect(parked.runs[0]!.attempts[0]).toMatchObject({ conversationId: attempt.conversationId, state: "failed" });
+
+  h.ports.resolveProjectSpawn = () => ({ kind: "available", account: {
+    engine: "claude", accountId: SPARE_ACCOUNT, kind: "managed",
+    home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" },
+  } });
+  const reseats: string[] = [];
+  const continuations: string[] = [];
+  h.ports.requestConversationReseat = async (conversationId, accountId) => { reseats.push(`${conversationId}:${accountId}`); };
+  h.ports.resumeSeveredTurn = async (input) => { continuations.push(input.clientMessageId); return true; };
+
+  await tickPipelines([], h.ports);
+  const resumed = loadPipelines().find((item) => item.id === pipeline.id)!;
+  expect(resumed.state).toBe("running");
+  expect(resumed.runs[0]!.attempts).toHaveLength(1);
+  expect(resumed.runs[0]!.attempts[0]).toMatchObject({ conversationId: attempt.conversationId, state: "running" });
+  expect(reseats).toEqual([`${attempt.conversationId}:${SPARE_ACCOUNT}`]);
+  expect(continuations).toHaveLength(1);
+});
+
+test("a Claude stage retains the source account's confirmed reset when no allowed account is free", async () => {
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines().find((item) => item.id === pipeline.id)!;
+  const attempt = running.runs[0]!.attempts[0]!;
+  attempt.paneId = null;
+  savePipelines([running]);
+  readFixtures(h, { "/codex/stage-1.jsonl": limitInterruptedTranscript("claude-known-reset") });
+
+  const now = Date.now();
+  const resetsAt = Math.floor(now / 1_000) + 15 * 60;
+  const observation: DurableQuotaObservation = {
+    engine: "claude", accountId: LIMITED_ACCOUNT, authenticated: true,
+    authCheckedAt: new Date(now - 1_000).toISOString(),
+    limits: { session: { usedPercent: 100, resetsAt }, weekly: null, plan: "max", capturedAt: Math.floor(now / 1_000) },
+    provenance: { source: "live", reason: null, staleSince: null },
+    observedAt: new Date(now - 1_000).toISOString(), bootId: "known-reset",
+  };
+  const selection = (unavailableIds: string[] = []) => selectProjectAccount({
+    project: pipeline.project, engine: "claude", model: "fable",
+    accounts: [{ id: LIMITED_ACCOUNT, authPresent: true }, { id: SPARE_ACCOUNT, authPresent: true }],
+    observations: [observation],
+    bindings: [{ engine: "claude", accountId: LIMITED_ACCOUNT, project: pipeline.project, createdAt: new Date(now).toISOString() }],
+    unavailableIds, now,
+  });
+  expect(selection()).toMatchObject({ kind: "exhausted", resetsAt });
+  h.ports.allowedAccountIds = () => [LIMITED_ACCOUNT];
+  h.ports.accountLabel = () => LIMITED_ACCOUNT_LABEL;
+  h.ports.resolveProjectSpawn = (_engine, request) => {
+    const selected = selection(request.unavailableIds ?? []);
+    return selected.kind === "available"
+      ? { kind: "unavailable", allowedAccountIds: [LIMITED_ACCOUNT] }
+      : selected;
+  };
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "known-reset-registry.json"));
+  registry.recordQuotaObservation(observation);
+  setAgentRegistryForTests(registry);
+  try {
+    h.ports.claudeAccountReset = defaultPipelinePorts().claudeAccountReset;
+  } finally {
+    setAgentRegistryForTests(null);
+  }
+  expect(h.ports.claudeAccountReset?.(LIMITED_ACCOUNT, "fable")).toBe(resetsAt);
+
+  await tickPipelines([], h.ports);
+  const parked = loadPipelines().find((item) => item.id === pipeline.id)!;
+  expect(parked).toMatchObject({
+    state: "needs_decision",
+    stateDetail: `rate limited until ${new Date(resetsAt * 1_000).toISOString()}, account ${LIMITED_ACCOUNT_LABEL}`,
+  });
+  expect(parked.runs[0]!.attempts[0]!.usageLimitedAccounts).toMatchObject([
+    { accountId: LIMITED_ACCOUNT, resetsAt },
+  ]);
+
+  const dateNow = spyOn(Date, "now").mockImplementation(() => (resetsAt + 1) * 1_000);
+  try {
+    h.ports.resumeSeveredTurn = async () => true;
+    await tickPipelines([], h.ports);
+    const resumed = loadPipelines().find((item) => item.id === pipeline.id)!;
+    expect(resumed.state).toBe("running");
+    expect(resumed.runs[0]!.attempts).toHaveLength(1);
+    expect(resumed.runs[0]!.attempts[0]).toMatchObject({ state: "running", conversationId: attempt.conversationId });
+  } finally {
+    dateNow.mockRestore();
+  }
+});
+
+test("a parked Claude stage continues its original conversation after that account's capacity returns", async () => {
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines().find((item) => item.id === pipeline.id)!;
+  const attempt = running.runs[0]!.attempts[0]!;
+  attempt.paneId = null;
+  savePipelines([running]);
+  readFixtures(h, { "/codex/stage-1.jsonl": limitInterruptedTranscript("claude-source-reset") });
+  usageLimitPorts(h, { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT] });
+  let recovered = false;
+  let allowed = [LIMITED_ACCOUNT];
+  h.ports.allowedAccountIds = () => allowed;
+  h.ports.claudeAccountRecovered = () => recovered;
+  const continuations: string[] = [];
+  h.ports.resumeSeveredTurn = async (input) => { continuations.push(input.conversationId); return true; };
+
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+  recovered = true;
+  allowed = [SPARE_ACCOUNT];
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+  allowed = [LIMITED_ACCOUNT];
+  await tickPipelines([], h.ports);
+  const resumed = loadPipelines()[0]!;
+  expect(resumed.state).toBe("running");
+  expect(resumed.runs[0]!.attempts).toHaveLength(1);
+  expect(resumed.runs[0]!.attempts[0]).toMatchObject({ conversationId: attempt.conversationId, state: "running" });
+  expect(continuations).toEqual([attempt.conversationId!]);
+});
+
+test("a previously limited Claude account becomes available for a later stage reseat and parked reconciliation", async () => {
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines()[0]!;
+  running.runs[0]!.attempts[0]!.paneId = null;
+  savePipelines([running]);
+  const fixtures = {
+    "/codex/stage-1.jsonl": limitInterruptedTranscript("claude-limited-a"),
+    "/codex/stage-2.jsonl": stageTranscript("claude-limited-b", [
+      { type: "user", timestamp: "2026-08-27T09:42:00.000Z", message: { role: "user", content: "continue" } },
+      { type: "assistant", timestamp: "2026-08-27T09:50:00.000Z", isApiErrorMessage: true, error: "rate_limit",
+        message: { role: "assistant", stop_reason: "stop_sequence", content: [{ type: "text", text: PROVIDER_LIMIT_NOTICE }] } },
+    ]),
+  };
+  readFixtures(h, fixtures);
+  usageLimitPorts(h, { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT, SPARE_ACCOUNT] });
+  h.ports.allowedAccountIds = () => [LIMITED_ACCOUNT, SPARE_ACCOUNT];
+  let recoveredA = false;
+  h.ports.claudeAccountRecovered = (accountId) => accountId === LIMITED_ACCOUNT && recoveredA;
+  let currentPath = "/codex/stage-1.jsonl";
+  h.ports.pathForConversation = () => currentPath;
+  const reseats: string[] = [];
+  h.ports.requestConversationReseat = async (_id, target) => { reseats.push(target); };
+  h.ports.conversationMigration = () =>
+    reseats.at(-1) === LIMITED_ACCOUNT && currentPath === "/codex/stage-2.jsonl"
+      ? { targetId: LIMITED_ACCOUNT, retry: false } : null;
+  h.ports.resumeSeveredTurn = async () => true;
+  h.ports.resolveProjectSpawn = (_engine, input) => {
+    const available = [LIMITED_ACCOUNT, SPARE_ACCOUNT].find((id) => !input.unavailableIds?.includes(id));
+    return available
+      ? { kind: "available", account: { engine: "claude", accountId: available, kind: "managed",
+        home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" } } }
+      : { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT, SPARE_ACCOUNT] };
+  };
+
+  await tickPipelines([], h.ports);
+  expect(reseats).toEqual([SPARE_ACCOUNT]);
+  currentPath = "/codex/stage-2.jsonl";
+  await tickPipelines([], h.ports);
+  const parked = loadPipelines()[0]!;
+  expect(parked.state).toBe("needs_decision");
+  expect(parked.runs[0]!.attempts[0]!.usageLimitedAccounts).toMatchObject([
+    { accountId: LIMITED_ACCOUNT, limitedAt: Date.parse("2026-08-27T09:41:00.000Z"), turnId: expect.any(String) },
+    { accountId: SPARE_ACCOUNT, limitedAt: Date.parse("2026-08-27T09:50:00.000Z"), turnId: expect.any(String) },
+  ]);
+  recoveredA = true;
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const resumed = loadPipelines()[0]!;
+  expect(resumed.state).toBe("running");
+  expect(resumed.runs[0]!.attempts).toHaveLength(1);
+  expect(reseats).toEqual([SPARE_ACCOUNT, LIMITED_ACCOUNT]);
+});
+
+test("separate Claude limit turns on one account receive separate registry deliveries", async () => {
+  const { emptyLaunchProfile } = await import("@/lib/accounts/migration/contracts");
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines()[0]!;
+  running.runs[0]!.attempts[0]!.paneId = null;
+  savePipelines([running]);
+  const source = limitInterruptedTranscript("claude-repeat-limit-1");
+  const fixtures = { "/codex/stage-1.jsonl": source };
+  readFixtures(h, fixtures);
+  usageLimitPorts(h, { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT] });
+  h.ports.allowedAccountIds = () => [LIMITED_ACCOUNT];
+  let recovered = false;
+  h.ports.claudeAccountRecovered = () => recovered;
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "claude-repeat-limit-registry.json"));
+  registry.reconcileConversations([{ engine: "claude", path: source, accountId: LIMITED_ACCOUNT,
+    launchProfile: emptyLaunchProfile({ cwd: pipeline.worktreeDir, project: pipeline.project, model: "fable", effort: "high" }),
+    turn: { state: "terminal", source: "lifecycle", terminalAt: "2026-08-27T09:41:00.000Z" },
+    observedAt: "2026-08-27T09:41:01.000Z" }]);
+  const conversation = registry.conversationForPath(source)!;
+  const deliveries: string[] = [];
+  h.ports.resumeSeveredTurn = async (input) => {
+    const receipt = registry.holdDelivery(conversation.id, input.text, input.clientMessageId);
+    deliveries.push(receipt.id);
+    registry.recordDeliveryOutcome(receipt.id, "delivered");
+    return true;
+  };
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+  recovered = true;
+  await tickPipelines([], h.ports);
+  expect(deliveries).toHaveLength(1);
+  await tickPipelines([], h.ports);
+  expect(deliveries.at(-1)).toBe(deliveries[0]);
+
+  recovered = false;
+  fixtures["/codex/stage-1.jsonl"] = stageTranscript("claude-repeat-limit-2", [
+    { type: "user", timestamp: "2026-08-27T09:42:00.000Z", message: { role: "user", content: "continue" } },
+    { type: "assistant", timestamp: "2026-08-27T09:50:00.000Z", isApiErrorMessage: true, error: "rate_limit",
+      message: { role: "assistant", stop_reason: "stop_sequence", content: [{ type: "text", text: PROVIDER_LIMIT_NOTICE }] } },
+  ]);
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+  recovered = true;
+  await tickPipelines([], h.ports);
+  expect(new Set(deliveries).size).toBe(2);
+  expect(loadPipelines()[0]!.runs[0]!.attempts).toHaveLength(1);
+});
+
+test("an explicitly pinned Claude stage parks despite another free account and resumes on its own", async () => {
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage(LIMITED_ACCOUNT)[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const running = loadPipelines()[0]!;
+  running.runs[0]!.attempts[0]!.paneId = null;
+  savePipelines([running]);
+  readFixtures(h, { "/codex/stage-1.jsonl": limitInterruptedTranscript("claude-pinned-limit") });
+  usageLimitPorts(h, { kind: "available", account: { engine: "claude", accountId: SPARE_ACCOUNT, kind: "managed",
+    home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" } } });
+  h.ports.allowedAccountIds = () => [LIMITED_ACCOUNT, SPARE_ACCOUNT];
+  let recovered = false;
+  h.ports.claudeAccountRecovered = () => recovered;
+  const reseats: string[] = [];
+  const continuations: string[] = [];
+  h.ports.requestConversationReseat = async (_id, target) => { reseats.push(target); };
+  h.ports.resumeSeveredTurn = async (input) => { continuations.push(input.conversationId); return true; };
+
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+  expect(reseats).toEqual([]);
+  recovered = true;
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("running");
+  expect(loadPipelines()[0]!.runs[0]!.attempts).toHaveLength(1);
+  expect(reseats).toEqual([]);
+  expect(continuations.length).toBeGreaterThan(0);
+  expect(new Set(continuations)).toEqual(new Set([running.runs[0]!.attempts[0]!.conversationId!]));
+});
+
+test("a recorded Claude limit moves the stage's real registry conversation and settles on its successor", async () => {
+  const { emptyLaunchProfile } = await import("@/lib/accounts/migration/contracts");
+  const { advanceConversationMigration, reconcileMigrations } = await import("@/lib/accounts/migration/coordinator");
+  const { enqueueStructuredMessage } = await import("@/lib/runtime/structuredMessageDelivery");
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const sourcePath = limitInterruptedTranscript("claude-real-reseat", "You've hit your session limit · resets 2:30pm (Europe/Kyiv)");
+  const successorPath = stageTranscript("claude-real-successor", [
+    { type: "user", timestamp: "2026-08-27T09:42:00.000Z", message: { role: "user", content: "continue after limit" } },
+    { type: "assistant", timestamp: "2026-08-27T09:43:00.000Z", message: { role: "assistant", stop_reason: "end_turn", content: [{ type: "text", text: PASS_TEXT }] } },
+  ]);
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "claude-limit-reseat-registry.json"));
+  registry.reconcileConversations([{
+    engine: "claude", path: sourcePath, accountId: LIMITED_ACCOUNT,
+    launchProfile: emptyLaunchProfile({ cwd: pipeline.worktreeDir, project: pipeline.project, model: "fable", effort: "high" }),
+    turn: { state: "terminal", source: "lifecycle", terminalAt: "2026-08-27T09:41:00.000Z" },
+    observedAt: "2026-08-27T09:41:01.000Z",
+  }]);
+  const conversation = registry.conversationForPath(sourcePath)!;
+  const previouslyLimitedAccount = "account-previously-limited";
+  registry.setEngineRouting("claude", previouslyLimitedAccount);
+  const running = loadPipelines().find((item) => item.id === pipeline.id)!;
+  Object.assign(running.runs[0]!.attempts[0]!, {
+    conversationId: conversation.id, agentPath: sourcePath, accountId: LIMITED_ACCOUNT, paneId: null,
+    usageLimitedAccounts: [{ accountId: previouslyLimitedAccount, engine: "claude", resetsAt: null }],
+  });
+  savePipelines([running]);
+  h.ports.pathForConversation = (id) => id === conversation.id ? registry.conversation(conversation.id)?.generations.at(-1)?.path ?? null : null;
+  h.ports.accountForTranscript = (_engine, transcriptPath) => {
+    const generation = registry.conversationForPath(transcriptPath)?.generations.find((item) => item.path === transcriptPath);
+    return generation?.accountId ? { accountId: generation.accountId, label: generation.accountId } : null;
+  };
+  setAgentRegistryForTests(registry);
+  try {
+    h.ports.conversationMigration = defaultPipelinePorts().conversationMigration;
+    h.ports.conversationDeliveryCompleted = defaultPipelinePorts().conversationDeliveryCompleted;
+  } finally {
+    setAgentRegistryForTests(null);
+  }
+  let reseatOperationId: string | null = null;
+  h.ports.requestConversationReseat = async (id, target) => {
+    reseatOperationId = registry.requestConversationReseat(id as never, target).migration?.operationId ?? null;
+  };
+  h.ports.resumeSeveredTurn = async (input) => {
+    const result = await enqueueStructuredMessage({
+      path: input.transcriptPath,
+      conversationId: input.conversationId,
+      clientMessageId: input.clientMessageId,
+      text: input.text,
+    }, {
+      enabled: () => true,
+      client: () => null,
+      registry: () => registry,
+      requestMigrationTick: () => {},
+    });
+    return result?.ok === true;
+  };
+  h.ports.durableTurnEvidence = durableStageTurnEvidence;
+  h.ports.resolveProjectSpawn = () => ({ kind: "available", account: {
+    engine: "claude", accountId: SPARE_ACCOUNT, kind: "managed",
+    home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" },
+  } });
+
+  await tickPipelines([], h.ports);
+  expect(registry.conversation(conversation.id)?.migration).toMatchObject({
+    targetId: SPARE_ACCOUNT, operationId: reseatOperationId,
+  });
+  expect(reseatOperationId).toBeTruthy();
+  expect(registry.pendingDeliveries(conversation.id)).toHaveLength(1);
+  const provider = {
+    virtualSource: true as const,
+    async create(input: { operationId: string }) {
+      return {
+        operationId: input.operationId, nativeId: "claude-real-successor", path: successorPath,
+        continuityPaths: [], historyHash: "fixture-history",
+        host: { kind: "claude-fork" as const, identity: "fixture-host", epoch: 1, verifiedAt: "2026-08-27T09:42:00.000Z" },
+      };
+    },
+    async verify() {},
+  };
+  const advanced = await advanceConversationMigration(conversation.id, registry, provider);
+  expect(advanced.migration?.phase).toBe("committed");
+  expect(advanced.id).toBe(conversation.id);
+  expect(advanced.generations.at(-1)).toMatchObject({ path: successorPath, accountId: SPARE_ACCOUNT });
+  const successorContents = fs.readFileSync(successorPath, "utf8");
+  fs.writeFileSync(successorPath, fs.readFileSync(sourcePath, "utf8"));
+  await tickPipelines([], h.ports);
+  expect(registry.conversation(conversation.id)?.migration).toMatchObject({
+    phase: "committed", targetId: SPARE_ACCOUNT, operationId: reseatOperationId,
+  });
+  expect(registry.conversationMigrationTargetWithPendingDelivery(conversation.id)).toBe(SPARE_ACCOUNT);
+  expect(registry.pendingDeliveries(conversation.id)).toHaveLength(1);
+  fs.writeFileSync(successorPath, successorContents);
+  const delivered: string[] = [];
+  await reconcileMigrations(provider, {
+    async deliver({ path: target }) { delivered.push(target); return "delivered"; },
+  }, registry);
+  expect(delivered).toEqual([successorPath]);
+  expect(registry.conversationMigrationTargetWithPendingDelivery(conversation.id)).toBeNull();
+
+  await tickPipelines([], h.ports);
+  const settled = loadPipelines().find((item) => item.id === pipeline.id)!;
+  expect(settled.runs[0]!.attempts).toHaveLength(1);
+  expect(settled.runs[0]!.attempts[0]).toMatchObject({
+    conversationId: conversation.id, agentPath: successorPath, accountId: SPARE_ACCOUNT,
+    verdict: { status: "pass" },
+  });
+  expect(h.spawnInputs).toHaveLength(1);
+});
+
+test("a failed Claude migration retries its original operation and held continuation", async () => {
+  const { emptyLaunchProfile } = await import("@/lib/accounts/migration/contracts");
+  const { advanceConversationMigration } = await import("@/lib/accounts/migration/coordinator");
+  const { enqueueStructuredMessage } = await import("@/lib/runtime/structuredMessageDelivery");
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const sourcePath = limitInterruptedTranscript("claude-failed-migration");
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "claude-failed-migration-registry.json"));
+  registry.reconcileConversations([{
+    engine: "claude", path: sourcePath, accountId: LIMITED_ACCOUNT,
+    launchProfile: emptyLaunchProfile({ cwd: pipeline.worktreeDir, project: pipeline.project, model: "fable", effort: "high" }),
+    turn: { state: "terminal", source: "lifecycle", terminalAt: "2026-08-27T09:41:00.000Z" },
+    observedAt: "2026-08-27T09:41:01.000Z",
+  }]);
+  const conversation = registry.conversationForPath(sourcePath)!;
+  registry.setEngineRouting("claude", "account-previously-limited");
+  const running = loadPipelines()[0]!;
+  Object.assign(running.runs[0]!.attempts[0]!, {
+    conversationId: conversation.id, agentPath: sourcePath, accountId: LIMITED_ACCOUNT, paneId: null,
+  });
+  savePipelines([running]);
+  setAgentRegistryForTests(registry);
+  try {
+    const defaults = defaultPipelinePorts();
+    h.ports.requestConversationReseat = defaults.requestConversationReseat;
+    h.ports.conversationMigration = defaults.conversationMigration;
+    h.ports.durableTurnEvidence = durableStageTurnEvidence;
+    h.ports.resolveProjectSpawn = () => ({ kind: "available", account: {
+      engine: "claude", accountId: SPARE_ACCOUNT, kind: "managed",
+      home: process.env.LLV_STATE_DIR!, transcriptRoot: process.env.LLV_STATE_DIR!, env: { NODE_ENV: "test" },
+    } });
+    h.ports.accountForTranscript = () => ({ accountId: LIMITED_ACCOUNT, label: LIMITED_ACCOUNT_LABEL });
+    h.ports.pathForConversation = (id) => id === conversation.id ? sourcePath : null;
+    h.ports.resumeSeveredTurn = async (input) => (await enqueueStructuredMessage({
+      path: input.transcriptPath, conversationId: input.conversationId,
+      clientMessageId: input.clientMessageId, text: input.text,
+    }, {
+      enabled: () => true, client: () => null, registry: () => registry,
+      requestMigrationTick: () => {}, kick: async () => {},
+      executeSwitch: async () => registry.conversation(conversation.id)!,
+    }))?.ok === true;
+
+    await tickPipelines([], h.ports);
+    const first = registry.conversation(conversation.id)!.migration!;
+    expect(first).toMatchObject({ phase: "requested", targetId: SPARE_ACCOUNT });
+    expect(registry.pendingDeliveries(conversation.id)).toHaveLength(1);
+    const failed = await advanceConversationMigration(conversation.id, registry, {
+      virtualSource: true,
+      async create() { throw new Error("provider temporarily unavailable"); },
+      async verify() {},
+    });
+    expect(failed.migration).toMatchObject({ phase: "failed-recoverable", operationId: first.operationId });
+
+    await tickPipelines([], h.ports);
+    expect(registry.conversation(conversation.id)!.migration).toMatchObject({
+      phase: "requested", operationId: first.operationId, targetId: SPARE_ACCOUNT,
+    });
+    expect(registry.pendingDeliveries(conversation.id)).toHaveLength(1);
+    expect(loadPipelines()[0]!.runs[0]!.attempts).toHaveLength(1);
+  } finally {
+    setAgentRegistryForTests(null);
+  }
+});
+
+test("a delivered Claude limit continuation releases later dead-host recovery", async () => {
+  const { emptyLaunchProfile } = await import("@/lib/accounts/migration/contracts");
+  const h = harness();
+  const pipeline = await create(h.ports, [{ ...usageLimitStage()[0], engine: "claude", model: "fable" }] as never);
+  await tickPipelines([], h.ports);
+  await tickPipelines([], h.ports);
+  const sourcePath = limitInterruptedTranscript("claude-delivered-then-dead");
+  const registry = new AgentRegistry(path.join(process.env.LLV_STATE_DIR!, "claude-delivered-then-dead-registry.json"));
+  registry.reconcileConversations([{
+    engine: "claude", path: sourcePath, accountId: LIMITED_ACCOUNT,
+    launchProfile: emptyLaunchProfile({ cwd: pipeline.worktreeDir, project: pipeline.project, model: "fable", effort: "high" }),
+    turn: { state: "terminal", source: "lifecycle", terminalAt: "2026-08-27T09:41:00.000Z" },
+    observedAt: "2026-08-27T09:41:01.000Z",
+  }]);
+  const conversation = registry.conversationForPath(sourcePath)!;
+  const running = loadPipelines()[0]!;
+  Object.assign(running.runs[0]!.attempts[0]!, {
+    conversationId: conversation.id, agentPath: sourcePath, accountId: LIMITED_ACCOUNT, paneId: null,
+  });
+  savePipelines([running]);
+  readFixtures(h, { [sourcePath]: sourcePath });
+  usageLimitPorts(h, { kind: "exhausted", resetsAt: null, allowedAccountIds: [LIMITED_ACCOUNT] });
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("needs_decision");
+
+  h.ports.claudeAccountRecovered = () => true;
+  h.ports.resumeSeveredTurn = async (input) => {
+    const receipt = registry.holdDelivery(conversation.id, input.text, input.clientMessageId);
+    registry.recordDeliveryOutcome(receipt.id, "delivered");
+    return true;
+  };
+  setAgentRegistryForTests(registry);
+  try {
+    h.ports.conversationDeliveryCompleted = defaultPipelinePorts().conversationDeliveryCompleted;
+  } finally {
+    setAgentRegistryForTests(null);
+  }
+  await tickPipelines([], h.ports);
+  expect(loadPipelines()[0]!.state).toBe("running");
+  h.ports.durableTurnEvidence = async () => null;
+  h.ports.conversationHostUnavailableSince = async () => new Date(1).toISOString();
+  await tickPipelines([], h.ports);
+  const recovered = loadPipelines()[0]!;
+  expect(recovered.state).toBe("needs_decision");
+  expect(recovered.stateDetail).not.toContain("Claude limit: continuing");
+  expect(h.calls.some((call) => call.startsWith("stop-host:build:1:"))).toBe(true);
 });
 
 test("a failover attempt edited to another engine launches there with none of the old engine's limits (graph slice 1)", async () => {
