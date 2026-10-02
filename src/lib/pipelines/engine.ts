@@ -3223,7 +3223,7 @@ function settleStageVerdict(
     attempt.state = "committing";
     setCursorState(pipeline, stage.id, "committing");
     persist();
-    commitPassedStage(pipeline, stage, attempt, ports);
+    commitPassedStage(pipeline, stage, attempt, ports, persist);
     return;
   }
   if (parsed.verdict.status !== "pass") {
