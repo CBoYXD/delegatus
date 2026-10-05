@@ -6058,6 +6058,205 @@ async function selfUpdateAutoMain(): Promise<void> {
   console.log(`self-update auto geometry: ${path.join(OUT_DIR, "self-update-auto.json")}`);
 }
 
+/* The update dialog for every form of installation: what each one must do before or
+   after an update, and how a ready, failed or rolled-back replacement reads. */
+async function selfUpdateInstallMain(): Promise<void> {
+  const messages = { en: (await import("../src/lib/i18n/en")).en, uk: (await import("../src/lib/i18n/uk")).uk };
+  seedHome();
+  const evidenceDir = process.env.SELF_UPDATE_INSTALL_EVIDENCE_DIR?.trim() || null;
+  const port = await freePort();
+  const baseUrl = `http://127.0.0.1:${port}`;
+  const old = "a".repeat(40);
+  const next = "b".repeat(40);
+  const revision = (sha: string) => ({ sha, short: sha.slice(0, 7), version: "1.6.1", date: "2026-01-01" });
+  const processView = (sha: string) => ({ ...stoppedProcess(), state: "healthy" as const, pid: 101, startedAt: "2026-01-01T00:00:00Z", revision: sha.slice(0, 7), lastHealthAt: "2026-01-01T00:00:00Z", lastHealthOk: true, tail: [] });
+  const base: Snapshot = {
+    mode: "checkout", unsupportedReason: null, installed: revision(next), available: null,
+    serving: { web: revision(old), runtimeHost: revision(old) }, check: { ...idleCheck(), state: "up-to-date", at: "2026-01-01T00:00:00Z" },
+    update: idleUpdate(), processes: { web: processView(old), runtimeHost: processView(old) }, busy: null,
+    meta: { branch: "main", remote: "https://github.com/example/project", checkout: null, pollMinutes: 15, serverTime: "2026-01-02T00:00:00Z" },
+  };
+  const auto = { availability: "available" as const, enabled: true, off: null, phase: "waiting" as const, target: revision(next), green: { state: "green" as const },
+    blockers: { turns: 2, stages: 1, operatorActiveAt: "2026-01-01T23:55:00Z", busy: false, memoryMb: null, unreadable: null }, waitingSince: "2026-01-01T00:00:00Z", longWait: false };
+  const states: Record<string, Snapshot> = {};
+  states["install-action"] = { ...base, auto: { ...auto, enabled: false, phase: "idle", blockers: null }, action: { id: "restart-service", button: true, unit: "delegatus.service" } };
+  states["install-switch"] = { ...base, auto: { ...auto, enabled: false, phase: "idle", blockers: null }, busy: "update",
+    update: { ...idleUpdate(), state: "running", target: next, targetShort: next.slice(0, 7), startedAt: "2026-01-02T00:00:00Z",
+      steps: [...idleUpdate().steps.map(step => ({ ...step, state: "done" as const })), { name: "switch", state: "running", startedAt: "2026-01-02T00:00:00Z", durationMs: null, exitCode: null, tail: [], failure: null }] } };
+  const idleAuto = { ...auto, enabled: false, phase: "idle" as const, blockers: null };
+  states["install-available"] = { ...base, installed: revision(old), available: revision(next),
+    check: { ...base.check, state: "update-available" }, auto: idleAuto };
+  states["install-package"] = { ...states["install-available"]!, mode: "package",
+    installed: revision(old), available: { ...revision(next), version: "1.6.2" },
+    update: idleUpdate(["fetch", "install", "ready"]), auto: { ...idleAuto, availability: "packaged" } };
+  // A published package that names no revision: it is named and left to its package manager.
+  states["install-package-manual"] = { ...states["install-package"]!, available: { sha: "", short: "", version: "1.6.2", date: "" } };
+  states["install-available-auto"] = { ...states["install-available"]!, auto: { ...idleAuto, enabled: true } };
+  states["install-package-auto"] = { ...states["install-package"]!, auto: { ...idleAuto, enabled: true, availability: "packaged" } };
+  // Commands contain invented install context and exercise wrapping at phone width.
+  const terminalPlan = Buffer.from(JSON.stringify({ target: next, root: "$HOME/Projects/example install",
+    requestFile: "$HOME/.local/state/example install/self-update/request-example.json",
+    releasePointer: "$HOME/.local/state/example install/self-update/release-example.json",
+    rollbackPointer: null, priorRevision: old.slice(0, 7), priorVersion: null, checkout: true })).toString("base64");
+  const command = `env LLV_LAUNCHER_CREDENTIAL_HANDOFF=1 HOME='$HOME' LLV_STATE_DIR='$HOME/.local/state/example install' XDG_CONFIG_HOME='$HOME/.config/example install' bun '$HOME/.cache/delegatus/example release/bin/launcher-relaunch.mjs' --terminal '${terminalPlan}' '$HOME/.cache/delegatus/example release/bin/cli.mjs' --port 45678 --hostname 0.0.0.0 --no-open`;
+  for (const id of ["restart-terminal", "start-launcher", "start-service", "update-first", "docker-deployments", "secure-handoff"] as const) {
+    const unsupported = ["start-launcher", "start-service", "docker-deployments"].includes(id);
+    states[`install-${id}`] = { ...base, mode: unsupported ? "unsupported" : "checkout", unsupportedReason: id === "docker-deployments" ? "docker-deployments" : unsupported ? "no-launcher" : null,
+      auto: idleAuto, action: { id, button: ["start-service", "update-first"].includes(id),
+        ...(["restart-terminal", "start-launcher"].includes(id) ? { command } : {}),
+        ...(id === "start-service" ? { unit: "delegatus.service" } : {}),
+        ...(id === "docker-deployments" ? { command: "LLV_VIEWER_DEPLOYMENTS=1 docker compose --profile runtime-host up -d" } : {}) } };
+  }
+  states["install-windows-terminal"] = { ...states["install-restart-terminal"]!, action: {
+    id: "restart-terminal", button: false, terminalEveryUpdate: true,
+    command: "& 'bun' '$HOME/example install/bin/launcher-relaunch.mjs' --terminal '<synthetic-plan>' '$HOME/example release/bin/cli.mjs' --port=45678 --no-open; exit $LASTEXITCODE",
+  } };
+  for (const shape of ["restart-service", "restart-terminal", "windows-terminal"] as const) {
+    const action = shape === "restart-service" ? { id: "restart-service" as const, button: true, unit: "delegatus.service" }
+      : states[shape === "windows-terminal" ? "install-windows-terminal" : "install-restart-terminal"]!.action;
+    states[`install-${shape}-ready`] = { ...base, action, auto: idleAuto,
+      update: { ...idleUpdate(), state: "done", target: next, targetShort: next.slice(0, 7),
+        startedAt: "2026-01-02T00:00:00Z", finishedAt: "2026-01-02T00:01:00Z",
+        steps: [...idleUpdate().steps.map(step => ({ ...step, state: "done" as const })),
+          { name: "switch", state: "pending", startedAt: null, durationMs: null, exitCode: null, tail: [], failure: null }] } };
+  }
+  for (const rollback of [false, true]) {
+    states[rollback ? "install-rollback" : "install-failed"] = { ...base, installed: revision(old), auto: { ...idleAuto,
+      off: { at: "2026-01-02T00:00:00Z", target: next, stage: "restart-web", reason: rollback ? "The replacement rolled back to the previous release" : "Runtime host health is unavailable" } },
+      update: { ...idleUpdate(), state: "failed", rolledBack: rollback, target: next, targetShort: next.slice(0, 7), startedAt: "2026-01-02T00:00:00Z", finishedAt: "2026-01-02T00:01:00Z",
+        steps: [...idleUpdate().steps.map(step => ({ ...step, state: "done" as const })), { name: "switch", state: "failed", startedAt: "2026-01-02T00:00:00Z", durationMs: 60_000, exitCode: null, tail: [], failure: { kind: "error", text: rollback ? "The replacement rolled back to the previous release" : "Runtime host health is unavailable" } }] } };
+  }
+  let server: ChildProcess | null = null;
+  let browser: Browser | null = null;
+  const report: { commit: string; frames: Record<string, unknown>; failures: string[] } = { commit: captureCommit(), frames: {}, failures: [] };
+  try {
+    server = startServer(port);
+    await waitForServer(baseUrl, server);
+    await waitForBoard(baseUrl, false);
+    await fetch(`${baseUrl}/api/onboarding`, { method: "PUT", headers: { "content-type": "application/json", origin: baseUrl }, body: JSON.stringify({ dismissed: true }) });
+    // The isolated install's first-run toast otherwise covers phone choices.
+    const telemetry = await fetch(`${baseUrl}/api/telemetry`, { method: "PUT", headers: { "content-type": "application/json", origin: baseUrl }, body: JSON.stringify({ enabled: false, noticeDismissed: true }) });
+    if (!telemetry.ok) throw new Error(`dismissing the capture notice answered ${telemetry.status}`);
+    browser = await chromium.launch({ args: ["--no-sandbox", "--disable-dev-shm-usage"], ...(process.env.CHROME_BIN ? { executablePath: process.env.CHROME_BIN } : {}) });
+    for (const width of [1440, 390]) for (const lang of ["en", "uk"] as const) for (const [name, snapshot] of Object.entries(states)) {
+      const localeWrite = await fetch(`${baseUrl}/api/operator/settings`, { method: "PUT", headers: { "content-type": "application/json", origin: baseUrl }, body: JSON.stringify({ locale: lang, source: "chosen" }) });
+      if (!localeWrite.ok) throw new Error(`setting ${lang} answered ${localeWrite.status}`);
+      const context = await browser.newContext({ viewport: { width, height: width === 390 ? 844 : 900 }, reducedMotion: "reduce" });
+      await context.addInitScript(seedInit);
+      await context.addInitScript((language: string) => localStorage.setItem("llv_lang", language), lang);
+      const page = await context.newPage();
+      await page.route(/\/api\/self-update(?:\?.*)?$/, (route) => route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify(snapshot) }));
+      await page.route("**/api/self-update/events*", (route) => route.fulfill({ status: 200, contentType: "text/event-stream", body: `event: state\ndata: ${JSON.stringify(snapshot)}\n\n` }));
+      await page.goto(`${baseUrl}/`);
+      await page.waitForFunction(() => {
+        if (document.querySelector("[data-self-update-dialog]")) return true;
+        window.dispatchEvent(new Event("llv:open-self-update"));
+        return false;
+      }, undefined, { timeout: 60_000 });
+      const tag = `${width}-${lang}-${name}`;
+      const primarySection = snapshot.mode === "unsupported" ? "install-action" : "auto";
+      await page.waitForSelector(`[data-section="${primarySection}"]`, { timeout: 30_000 });
+      if (snapshot.mode !== "unsupported") {
+        await page.locator('[data-section="auto"]').scrollIntoViewIfNeeded();
+        const geometry = await page.evaluate(() => {
+          const dialog = document.querySelector<HTMLElement>("[data-self-update-dialog]")!;
+          const card = dialog.querySelector<HTMLElement>('[data-section="auto"]')!;
+          const button = card.querySelector<HTMLButtonElement>('[data-action="toggle-auto"]')!;
+          const outer = dialog.getBoundingClientRect();
+          const rect = card.getBoundingClientRect();
+          const control = button.getBoundingClientRect();
+          const blockerRows = [...card.querySelectorAll<HTMLElement>("ul li")].map((row) => {
+            const range = document.createRange(); range.selectNodeContents(row);
+            const bounds = [...range.getClientRects()];
+            return { text: row.innerText, overflow: row.scrollWidth - row.clientWidth,
+              left: Math.min(...bounds.map((bound) => bound.left)), right: Math.max(...bounds.map((bound) => bound.right)), lines: bounds.length };
+          });
+          return { blockerRows, cardOverflow: card.scrollWidth - card.clientWidth, overflow: dialog.scrollWidth - dialog.clientWidth,
+            card: { x: rect.x, y: rect.y, width: rect.width, height: rect.height },
+            controlVisible: control.left >= outer.left && control.right <= outer.right && control.top >= outer.top && control.bottom <= outer.bottom,
+            text: card.innerText.slice(0, 600) };
+        });
+        report.frames[tag] = geometry;
+        if (geometry.overflow > 1 || geometry.cardOverflow > 1 || !geometry.controlVisible) report.failures.push(`${tag}: overflow or clipped switch`);
+        if (geometry.blockerRows.some(row => row.overflow > 1 || row.left < geometry.card.x - 1 || row.right > geometry.card.x + geometry.card.width + 1)) report.failures.push(`${tag}: blocker text spills beyond card`);
+        if (!geometry.text.includes(lang === "uk" ? "Автооновлення" : "Automatic updates")) report.failures.push(`${tag}: wrong interface language`);
+      }
+      if (name.startsWith("install-")) {
+        const section = snapshot.action ? "install-action" : "update";
+        const target = page.locator(`[data-section="${section}"]`);
+        await target.scrollIntoViewIfNeeded();
+        const installation = await target.evaluate(element => {
+          const bounds = element.getBoundingClientRect();
+          const buttons = [...element.querySelectorAll<HTMLButtonElement>("button")].map(button => {
+            const rect = button.getBoundingClientRect();
+            return { text: button.innerText, width: rect.width, height: rect.height,
+              inside: rect.left >= bounds.left && rect.right <= bounds.right && rect.top >= bounds.top && rect.bottom <= bounds.bottom };
+          });
+          const textBounds = [...element.querySelectorAll<HTMLElement>("p, code")].flatMap(node => {
+            const range = document.createRange(); range.selectNodeContents(node);
+            return [...range.getClientRects()].map(rect => ({ left: rect.left, right: rect.right }));
+          });
+          // The text as it is laid out, one block to a line. Run together, a sentence
+          // that ends in `@latest.` reads on into the next block like an address.
+          return { overflow: element.scrollWidth - element.clientWidth, text: (element as HTMLElement).innerText,
+            update: element.getAttribute("data-update"),
+            action: !!element.querySelector('[data-action="install-action"]'), buttons,
+            clippedText: textBounds.some(rect => rect.left < bounds.left - 1 || rect.right > bounds.right + 1),
+            untranslated: /selfUpdate\.[A-Za-z]/.test(element.textContent ?? "") };
+        });
+        report.frames[`${tag}-installation`] = installation;
+        if (installation.overflow > 1 || installation.clippedText || installation.untranslated
+          || snapshot.action?.button && !installation.action
+          || installation.buttons.some(button => !button.inside || width === 390 && (button.width < 44 || button.height < 44))) report.failures.push(`${tag}: install surface or control is unreadable`);
+        if (snapshot.action) {
+          const key = snapshot.action.terminalEveryUpdate ? "selfUpdate.action.restart-terminal-windows" : `selfUpdate.action.${snapshot.action.id}` as const;
+          // The card names the unit it restarts or starts inside the sentence.
+          const template = messages[lang][key];
+          const instruction = typeof template === "string" ? template.replaceAll("{unit}", snapshot.action.unit ?? "") : null;
+          if (!instruction || instruction.includes("{") || !installation.text?.includes(instruction)) report.failures.push(`${tag}: missing localized prerequisite instruction`);
+          if (snapshot.action.command && !installation.text?.includes(snapshot.action.command)) report.failures.push(`${tag}: incomplete terminal command`);
+        }
+        if (name === "install-available" || name === "install-available-auto" || name === "install-package" || name === "install-package-auto") {
+          const instruction = messages[lang]["selfUpdate.update.noteApply"];
+          if (typeof instruction !== "string" || !installation.text?.includes(instruction)
+            || /Nothing restarts|next quiet moment|Нічого не перезапускається|найближчу тиху хвилину/.test(installation.text ?? "")) report.failures.push(`${tag}: confirmed update copy contradicts immediate apply`);
+        }
+        if (name === "install-package-manual") {
+          const instruction = messages[lang]["selfUpdate.update.packageManual"];
+          if (installation.update !== "package-manual" || typeof instruction !== "string" || !installation.text?.includes(instruction)
+            || !installation.text.includes(snapshot.available!.version) || installation.buttons.length) report.failures.push(`${tag}: a package without a revision is not left to its package manager`);
+        }
+        if (/^install-(restart-service|restart-terminal|windows-terminal)-ready$/.test(name)) {
+          const partial = await page.locator('[data-section="header"], [data-outcome="done"]').allTextContents();
+          const controls = await page.locator('[data-action="restart-web"], [data-action="arm-host"], [data-action="start-host"], [data-action="confirm-host"]').count();
+          report.frames[`${tag}-whole-installation`] = { text: partial.join(" "), partialControls: controls };
+          if (controls || /restart web|restart the runtime host|Restart web|перезапустіть веб|перезапустіть runtime host|Перезапустіть веб/.test(partial.join(" ")))
+            report.failures.push(`${tag}: partial restart contradicts the installation action`);
+        }
+        if (name === "install-switch" && !installation.text?.includes(lang === "uk" ? "Замінити" : "Replace")) report.failures.push(`${tag}: switch is missing`);
+      }
+      const frame = path.join(OUT_DIR, `${tag}.png`);
+      await page.screenshot({ path: frame });
+      if (evidenceDir) {
+        fs.mkdirSync(evidenceDir, { recursive: true });
+        fs.copyFileSync(frame, path.join(evidenceDir, `${tag}.png`));
+      }
+      await context.close();
+    }
+  } finally {
+    await browser?.close();
+    await stop(server);
+  }
+  const result = JSON.stringify(report, null, 2) + "\n";
+  fs.writeFileSync(path.join(OUT_DIR, "self-update-install.json"), result);
+  if (evidenceDir) {
+    fs.mkdirSync(evidenceDir, { recursive: true });
+    fs.writeFileSync(path.join(evidenceDir, "geometry.json"), result);
+  }
+  if (report.failures.length) throw new Error(report.failures.join("; "));
+  console.log(`self-update install geometry: ${path.join(OUT_DIR, "self-update-install.json")}`);
+}
+
 /* The Linked installs dialog (#2333). Every /api/links* answer is a fixture, so nothing pairs, mints
    or saves anywhere. Frames are named {width}-{lang}-{frame}; LINKING_EVIDENCE_DIR receives a copy. */
 type LinkingFixture = {
@@ -6392,6 +6591,7 @@ if (process.env.BOARD_CAPTURE_CASE === "hydration") await hydrationMain();
 else if (process.env.BOARD_CAPTURE_CASE === "install-ping") await installPingMain();
 else if (process.env.BOARD_CAPTURE_CASE === "header") await headerMain();
 else if (process.env.BOARD_CAPTURE_CASE === "self-update-auto") await selfUpdateAutoMain();
+else if (process.env.BOARD_CAPTURE_CASE === "self-update-install") await selfUpdateInstallMain();
 else if (process.env.BOARD_CAPTURE_CASE === "linking") await linkingMain();
 else if (process.env.BOARD_CAPTURE_CASE === "activity") await activityMain();
 else if (process.env.BOARD_CAPTURE_CASE === "activity-members") await activityMembersMain();
