@@ -104,6 +104,9 @@ export const server = Bun.serve({
 export const stop = () => { server.stop(true); process.exit(0); };
 process.on("SIGINT", stop);
 process.on("SIGTERM", stop);
+/* A case that needs this Viewer to start processes of its own puts them here. */
+const generation = join(process.env.LLV_STATE_DIR ?? "", "fixture-generation.mjs");
+if (process.env.LLV_STATE_DIR && existsSync(generation)) await import(generation);
 `;
 
 export const STUB_HOST = `
@@ -144,7 +147,7 @@ export function install(options: { oldSupervisor?: boolean; oldServerRuntime?: b
   for (const dir of [path.join(checkout, "bin"), path.join(checkout, "node_modules", ".bin"), path.join(checkout, "dist"), home, state, cache, path.join(root, "tmp")]) {
     mkdirSync(dir, { recursive: true });
   }
-  for (const name of ["cli.mjs", "telemetry-notice.mjs", "agent-binaries.mjs", "server-runtime.mjs", "tailscale.mjs", "self-update-supervisor.mjs", "appDir.mjs", "envAlias.mjs", "legacySystemd.mjs", "internalService.mjs", "skillLinks.mjs", "oomPolicy.mjs", "launcher-relaunch.mjs", "launcher-adoption.mjs", "launcher-lock.mjs", "launcher-service-proof.mjs", "windows-process-identity.mjs", "viewerGateKey.mjs", "darwin-process-identity.mjs", "launcher-credentials.mjs"]) {
+  for (const name of ["cli.mjs", "telemetry-notice.mjs", "agent-binaries.mjs", "server-runtime.mjs", "tailscale.mjs", "self-update-supervisor.mjs", "appDir.mjs", "envAlias.mjs", "legacySystemd.mjs", "internalService.mjs", "skillLinks.mjs", "oomPolicy.mjs", "launcher-relaunch.mjs", "launcher-adoption.mjs", "launcher-lock.mjs", "telegram-connector-retire.mjs", "viewer-helpers-retire.mjs", "launcher-service-proof.mjs", "windows-process-identity.mjs", "viewerGateKey.mjs", "darwin-process-identity.mjs", "launcher-credentials.mjs"]) {
     copyFileSync(path.resolve("bin", name), path.join(checkout, "bin", name));
   }
   if (options.oldSupervisor) {

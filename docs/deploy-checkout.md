@@ -49,6 +49,47 @@ catalog is pending or stale, or transcript evidence is unreadable or projected.
 A consistently capped inventory needs a complete enumeration before this
 procedure can run.
 
+With `KillMode=process` a restart spares every process left in the service's
+cgroup, and while one remains systemd starts the replacement in that old cgroup
+path instead of the slice the unit configures. Preflight therefore reads the
+service's kernel cgroup subtree last, immediately before publication, and
+classifies each member by walking its parents to the serving launcher, Viewer
+or runtime host, or to a live agent host from the protected-host capture, each
+matched by its start identity. Any other member refuses the switch before
+publication or restart and is named on standard error and in `switch.log`:
+pid, start identity, start time, parent pid and the base names of its
+executable and script, never its arguments. Nothing is signalled. A subtree
+that cannot be read whole, or a member whose identity changes while it is
+read, refuses as well.
+
+The Viewer's own helpers do not reach that refusal in normal operation. The
+launcher starts each Viewer leading a process group of its own: that group is
+the Viewer's generation. Everything the Viewer starts without detaching it,
+such as a git or gh command or a worker, stays in that group, and so does
+everything those processes fork later. Agents, structured hosts, workflow
+setup commands and sign-ins start detached, in a group of their own, and are
+never members.
+
+The Telegram connector holds its Viewer's stdin as a lease and ends at end of
+file. The connector provisioner, the transcript search index worker, the file
+scan worker, the state backup pass, the update drain's work reads and local
+transcription run under `bin/helper-lease.mjs`, which ends the helper's whole
+process group when the Viewer exits, however it exits. The provisioner and the
+index worker also end when their Viewer hands release traffic to a successor.
+A worker that reads a request on its standard input gets it on the guardian's
+fd 3, so the lease is never the request pipe. A self-update step and the
+resource collector lead groups of their own so their deadlines can end them;
+they are recorded with their Viewer under `<state>/helpers`.
+
+Whenever a Viewer exits (stopped, replaced by a web restart, or crashed), the
+launcher retires its generation before it starts the next Viewer or exits:
+it waits for the connector and the recorded helpers whose owner is that
+Viewer, and for the members of the group it led, which it reads afresh on
+every poll, so a child forked after the Viewer stopped is found too. What is
+still running after three seconds is terminated, then killed, each process by
+its start identity, never the group as a whole. A successor leads its own
+group and records its own helpers, so it is left alone.
+
 Validate without publishing or restarting:
 
 ```sh
@@ -118,9 +159,17 @@ bounded recovery reads. A terminal host-loss error without a live replacement
 records lost work. A stage's ordinary completed verdict also counts as completed
 work when its host exits.
 
+Every serving sample also checks placement: the unit's `ControlGroup` must be
+its configured `Slice`'s own `ControlGroup` followed by the unit name, and the
+launcher, Viewer and runtime host must run inside it. A missing value fails the
+check. The sample records the expected and actual cgroup, and when they differ,
+the members that neither the serving generation nor an agent accounts for; the
+`Verdict:` line repeats the mismatch. The baseline is exempt in preflight,
+because reaching the configured slice is what the restart does.
+
 The final verdict describes the final sample: `pass` requires all three
-processes serving the target, successful HTTP/socket/MCP/service checks and
-protected work preserved or recovered. `fail` names unhealthy or different
+processes serving the target, successful HTTP/socket/MCP/service/placement
+checks and protected work preserved or recovered. `fail` names unhealthy or different
 serving processes or confirmed lost work. `needs_decision` names unresolved
 protected work or a preflight refusal. Earlier submission or read errors cannot
 override a healthy recovered final state. The procedure issues one restart and

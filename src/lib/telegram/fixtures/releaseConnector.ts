@@ -1,28 +1,25 @@
-import { spawnSync } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import path from "node:path";
 
 import { statePath } from "@/lib/configDir";
 
 import type { TelegramAdapter } from "../adapter";
-import { connectorServerName, ensureTelegramConnector, stopTelegramConnector, type ConnectorProbe, type TelegramConnectorPorts } from "../connector";
+import { connectorServerName, ensureTelegramConnector, spawnTelegramConnectorProcess, stopTelegramConnector, type ConnectorProbe, type TelegramConnectorPorts } from "../connector";
 import { stagedConnectorSourceDir } from "../packaging";
-import { TelegramConnectionService } from "../service";
+import { TelegramConnectionService, type TelegramServicePorts } from "../service";
 
-/**
- * A connector as a self-update leaves it: started by a Viewer process that
- * served from one release directory and has exited, while the connector it
- * detached runs on. The supervisor's own code starts and records it, in a
- * second process, so the record is the one a release writes; only the
- * connector program is a stand-in that waits to be stopped.
- *
- * The stored session must already be in the state directory. The caller stops
- * the process by the pid returned here.
- */
-export function startConnectorFromRelease(releaseDir: string): { pid: number; entrypoint: string } {
+/** The connector program's stand-in: it waits to be stopped, and ignores its
+    stdin lease, as a runner started before leases did. */
+function writeStandInEntrypoint(releaseDir: string): string {
   const entrypoint = path.join(releaseDir, "bin", "telegram-mcp-server.py");
   fs.mkdirSync(path.dirname(entrypoint), { recursive: true });
   fs.writeFileSync(entrypoint, "setInterval(() => undefined, 1000);\n");
+  return entrypoint;
+}
+
+function connectorStarter(releaseDir: string, env: Record<string, string>): { supervisor: string; entrypoint: string; env: NodeJS.ProcessEnv } {
+  const entrypoint = writeStandInEntrypoint(releaseDir);
   fs.mkdirSync(stagedConnectorSourceDir(), { recursive: true, mode: 0o700 });
   const supervisor = path.join(releaseDir, "start-connector.mjs");
   fs.writeFileSync(supervisor, [
@@ -46,8 +43,9 @@ export function startConnectorFromRelease(releaseDir: string): { pid: number; en
     "process.stdout.write(String(pid));",
     "",
   ].join("\n"));
-  const started = spawnSync(process.execPath, [supervisor], {
-    encoding: "utf8",
+  return {
+    supervisor,
+    entrypoint,
     env: {
       ...process.env,
       LLV_STATE_DIR: statePath(),
@@ -55,27 +53,68 @@ export function startConnectorFromRelease(releaseDir: string): { pid: number; en
       LLV_TELEGRAM_SERVER_BRIDGE: entrypoint,
       LLV_TELEGRAM_API_ID: "12345",
       LLV_TELEGRAM_API_HASH: "0123456789abcdef0123456789abcdef",
+      ...env,
     },
-  });
-  const pid = Number(started.stdout);
-  if (started.status !== 0 || !Number.isInteger(pid) || pid <= 1) {
-    throw new Error(`the earlier release could not start its connector: ${started.stderr}`);
+  };
+}
+
+function startedConnector(status: number | null, stdout: string, stderr: string, entrypoint: string): { pid: number; entrypoint: string } {
+  const pid = Number(stdout);
+  if (status !== 0 || !Number.isInteger(pid) || pid <= 1) {
+    throw new Error(`the earlier release could not start its connector: ${stderr}`);
   }
   return { pid, entrypoint };
 }
 
 /**
- * The connection service of the release that takes over. Its health check is
- * the production one and so is the supervisor under it; the stand-ins are the
- * listener's answers (it verifies whatever listens), the account read and the
- * host registration. `calls.spawns` counts the connectors it had to start
- * itself, and a start it attempts fails, so a second connector cannot pass.
+ * A connector that outlived the Viewer that started it, as a self-update or a
+ * service restart used to leave it: started by a Viewer process that served
+ * from one release directory and has exited, while the connector it detached
+ * runs on. The supervisor's own code starts and records it, in a second
+ * process, so the record is the one a release writes; only the connector
+ * program is a stand-in that waits to be stopped.
+ *
+ * The stored session must already be in the state directory. The caller stops
+ * the process by the pid returned here.
  */
-export function releaseTakeover(connectorToken: string): { service: TelegramConnectionService; calls: { spawns: number } } {
-  const calls = { spawns: 0 };
+export function startConnectorFromRelease(releaseDir: string): { pid: number; entrypoint: string } {
+  const starter = connectorStarter(releaseDir, {});
+  const started = spawnSync(process.execPath, [starter.supervisor], { encoding: "utf8", env: starter.env });
+  return startedConnector(started.status, started.stdout, started.stderr, starter.entrypoint);
+}
+
+/** The same start from a Viewer that runs beside this process, under `env`
+    (another release's PORT): this process keeps reaping its own children
+    while the other one stops them. */
+export async function startConnectorFromReleaseBeside(releaseDir: string, env: Record<string, string>): Promise<{ pid: number; entrypoint: string }> {
+  const starter = connectorStarter(releaseDir, env);
+  const child = spawn(process.execPath, [starter.supervisor], { env: starter.env, stdio: ["ignore", "pipe", "pipe"] });
+  let stdout = "";
+  let stderr = "";
+  child.stdout.on("data", (chunk: Buffer) => { stdout += chunk.toString(); });
+  child.stderr.on("data", (chunk: Buffer) => { stderr += chunk.toString(); });
+  const status = await new Promise<number | null>((resolve) => child.once("close", resolve));
+  return startedConnector(status, stdout, stderr, starter.entrypoint);
+}
+
+/**
+ * The connection service of the release that takes over. Its health check is
+ * the production one and so is the supervisor under it, which starts the
+ * release's stand-in runner under its stdin lease; the other stand-ins are the
+ * listener's answers (it verifies whatever listens), the account read and the
+ * host registration. `calls.pids` names the runners it started; the caller
+ * stops them with `stopTelegramConnector`. `overrides` replaces service ports.
+ */
+export function releaseTakeover(connectorToken: string, overrides: Partial<TelegramServicePorts> = {}): { service: TelegramConnectionService; calls: { spawns: number; pids: number[] } } {
+  const calls = { spawns: 0, pids: [] as number[] };
   const verified: ConnectorProbe = { ok: true, serverName: connectorServerName(connectorToken), tools: [{ name: "get_me", readOnly: true }] };
   const supervisor: TelegramConnectorPorts = {
-    spawn: () => { calls.spawns += 1; return null; },
+    spawn: (spec) => {
+      calls.spawns += 1;
+      const child = spawnTelegramConnectorProcess(spec);
+      if (child?.pid) calls.pids.push(child.pid);
+      return child;
+    },
     probe: async () => verified,
     sleep: async () => {},
     now: () => Date.now(),
@@ -95,20 +134,26 @@ export function releaseTakeover(connectorToken: string): { service: TelegramConn
     unregisterHosts: () => {},
     now: () => Date.now(),
     credentialsConfigured: () => true,
+    ...overrides,
   });
   return { service, calls };
 }
 
-/** Runs the release that takes over with its connector paths under `releaseDir`. */
+/** Runs the release that takes over with its connector paths under `releaseDir`
+    and the API credentials its own runner starts with. */
 export async function asRelease<T>(releaseDir: string, run: () => Promise<T>): Promise<T> {
-  const previous = { python: process.env.LLV_TELEGRAM_PYTHON, entry: process.env.LLV_TELEGRAM_SERVER_BRIDGE };
+  const names = ["LLV_TELEGRAM_PYTHON", "LLV_TELEGRAM_SERVER_BRIDGE", "LLV_TELEGRAM_API_ID", "LLV_TELEGRAM_API_HASH"] as const;
+  const previous = Object.fromEntries(names.map((name) => [name, process.env[name]]));
   process.env.LLV_TELEGRAM_PYTHON = process.execPath;
-  process.env.LLV_TELEGRAM_SERVER_BRIDGE = path.join(releaseDir, "bin", "telegram-mcp-server.py");
+  process.env.LLV_TELEGRAM_SERVER_BRIDGE = writeStandInEntrypoint(releaseDir);
+  process.env.LLV_TELEGRAM_API_ID = "12345";
+  process.env.LLV_TELEGRAM_API_HASH = "0123456789abcdef0123456789abcdef";
   try {
     return await run();
   } finally {
-    if (previous.python === undefined) delete process.env.LLV_TELEGRAM_PYTHON; else process.env.LLV_TELEGRAM_PYTHON = previous.python;
-    if (previous.entry === undefined) delete process.env.LLV_TELEGRAM_SERVER_BRIDGE; else process.env.LLV_TELEGRAM_SERVER_BRIDGE = previous.entry;
+    for (const name of names) {
+      if (previous[name] === undefined) delete process.env[name]; else process.env[name] = previous[name];
+    }
   }
 }
 

@@ -3,6 +3,7 @@ import fs from "node:fs";
 import path from "node:path";
 
 import { statePath } from "@/lib/configDir";
+import { viewerReleaseOwnsTraffic } from "@/lib/viewerReleaseTraffic";
 import { discardUnsupportedApiCredentials } from "@/lib/environmentIsolation";
 import { redactBounded } from "@/lib/monitor/redact";
 import { RuntimeHostUnavailableError } from "@/lib/runtime/client";
@@ -118,29 +119,7 @@ interface ViewerRuntimeActivationSteps {
   publishViewerReleaseReady: () => void;
 }
 
-/** Candidate containers share production state while their health gate runs.
- * The durable proxy target grants authority to the endpoint currently serving
- * traffic. A missing target keeps local development and first boot active. */
-export function viewerReleaseOwnsTraffic(
-  env: Readonly<Record<string, string | undefined>> = process.env,
-  readTarget: () => string = () => fs.readFileSync(statePath("viewer-release.json"), "utf8"),
-): boolean {
-  const port = env.PORT?.trim();
-  if (!port) return true;
-  let raw: string;
-  try {
-    raw = readTarget();
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT";
-  }
-  try {
-    const target = JSON.parse(raw) as { endpoint?: unknown };
-    if (typeof target.endpoint !== "string") return false;
-    return new URL(target.endpoint).port === port;
-  } catch {
-    return false;
-  }
-}
+export { viewerReleaseOwnsTraffic };
 
 /** Names the release that demoted this Viewer: the durable target that now
  * appoints its successor. A turn cut by this release records it as the
@@ -979,6 +958,14 @@ export async function registerViewerRuntime(): Promise<void> {
         relays.stopExternalRelayPollers();
       } catch (error) {
         console.error("[external relay] poller stop failed", error instanceof Error ? error.name : "unknown");
+      }
+      /* The successor owns the Telegram connector from here: this Viewer
+         stops starting or replacing one and ends the runner it started. */
+      try {
+        const connector = await import("@/lib/telegram/connector");
+        await connector.retireTelegramConnectorSupervisor();
+      } catch (error) {
+        console.error("[telegram connector] retirement failed", error instanceof Error ? error.name : "unknown");
       }
       await quiesceStartup();
       await completeViewerReleaseDemotion(async () => {
