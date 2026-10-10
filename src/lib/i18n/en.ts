@@ -4276,6 +4276,7 @@ export const en = {
   "kanban.shownReceipt": "«{title}» is back on the board",
   "kanban.showFailed": "Couldn't show «{title}»: {error}",
   "kanban.columns": "Columns",
+  "kanban.wire.goTo": "Go to «{title}»",
   "kanban.scrollTo": "Scroll to {column}",
   "kanban.columnCount": "{shown} of {total}",
   "kanban.columnWorking": { one: "{count} working", other: "{count} working" },
