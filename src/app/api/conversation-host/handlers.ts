@@ -26,7 +26,7 @@ import { NextRequest, NextResponse } from "next/server";
 import type { DeliveryOutcome } from "@/lib/delivery";
 import { structuredHostsEnabled } from "@/lib/runtime/flags";
 import type { AccountChoiceActor } from "@/lib/accounts/accountOverrides";
-import { callerConversationId, directOperatorActivityAuthority } from "@/lib/agent/operatorAuthority";
+import { callerConversationId, directOperatorActivityAuthority, operatorBrowserRequest } from "@/lib/agent/operatorAuthority";
 import { reconfigurationFromBody } from "@/lib/agent/reconfigure";
 import { listFiles } from "@/lib/scanner";
 import { pathAllowed } from "@/lib/scanner/roots";
@@ -382,7 +382,12 @@ export async function conversationHostPOST(req: NextRequest, options?: { actor: 
         return NextResponse.json({ error: "direct operator activity could not be recorded" }, { status: 503 });
       }
     }
+    const controlCaller = callerConversationId(req);
     const result = await dependencies.applyConversationAction({
+      actor: controlCaller ? { kind: "agent", conversationId: controlCaller } : { kind: "operator" },
+      ...(["interrupt", "kill"].includes(explicitAction) ? { controlOrigin: controlCaller
+        ? { kind: "agent" as const, conversationId: controlCaller }
+        : operatorBrowserRequest(req) ? { kind: "operator" as const } : API_CLIENT_ORIGIN } : {}),
       conversationId,
       transcriptPath: filePath,
       action: explicitAction,
