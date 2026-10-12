@@ -95,7 +95,7 @@ import { isLifecycleEventType } from "@/lib/lifecycle/vocabulary";
 import { recordBridgeDirectiveAnswer, recordBridgeDirectivePendingAnswer, recordManagerReport } from "@/lib/bridge/service";
 import { bridgeDirectiveBody, bridgeDirectiveId, type BridgeTrailer } from "@/lib/bridge/directive";
 import { seatIdentityResolver } from "@/lib/bridge/seatIdentity";
-import { BRIDGE_REPORT_COMPLETE_MAX_BYTES, isBridgeReportClass, type BridgeReportCompleteV1, type BridgeReportTelegram, type CanonicalSeatConversationId } from "@/lib/bridge/types";
+import { BRIDGE_REPORT_COMPLETE_MAX_BYTES, isBridgeReportClass, isBridgeReportOutcomeKind, type BridgeReportCompleteV1, type BridgeReportOutcome, type BridgeReportTelegram, type CanonicalSeatConversationId } from "@/lib/bridge/types";
 import { bridgeReportComplete, findBridgeReport, recordBridgeReportTelegram, scopedReportId } from "@/lib/bridge/store";
 import { EMPTY_DENY_LIST, type PublicDenyList } from "@/lib/bridge/publicSafe";
 import { issueReportApproval, issueReportApprovalDrafts, issueReportApprovalReplies, operatorMessagesOf, type OperatorMessage } from "@/lib/issueReports/approval";
@@ -3454,6 +3454,8 @@ async function bridgeReport(
     ? [...new Set(args.covers.filter((entry): entry is string => typeof entry === "string" && entry.trim() !== "").map((entry) => entry.trim()))].slice(0, 64)
     : [];
   const coversOwed = args.coversOwed === true;
+  const outcomeKind = args.outcome === undefined || args.outcome === null ? null : text(args.outcome);
+  if (outcomeKind !== null && !isBridgeReportOutcomeKind(outcomeKind)) throw new Error("outcome must be incident or publication");
 
   const origin = attributionOf(dependencies);
   /* Folded through the project aliases once, here: the seat tick reads the log
@@ -3508,6 +3510,10 @@ async function bridgeReport(
   let storedBody: string;
   let complete: BridgeReportCompleteV1 | null = null;
   let telegramCopy: { chat: string; html: string; topicId?: number } | null = null;
+  /* «Готово» (docs/design/done-section.md §2.3): the marker is the
+     orchestrator's own, kept beside its row with the summary it rendered. */
+  let outcome: BridgeReportOutcome | null = null;
+  if (outcomeKind !== null && origin.kind !== "manager") warnings.push("outcome was ignored: only the project's orchestrator marks an outcome.");
   if (origin.kind === "manager") {
     /* Only a chat the operator chose for the project is posted to (§5.6). */
     const destination = project ? effectiveReportTelegram(project) : null;
@@ -3548,6 +3554,11 @@ async function bridgeReport(
     const language = languageMismatchWarning("report", [summary, ...Object.values(sections).flat(), hasSections ? "" : body].join("\n"), locale);
     if (language) warnings.push(language);
     storedBody = renderPlain(rendered.cut);
+    if (outcomeKind !== null) {
+      const line = rendered.cut.summary || rendered.cut.sections.flatMap((section) => section.items)[0] || "";
+      if (line) outcome = { kind: outcomeKind, summary: line };
+      else warnings.push("outcome was ignored: the report has no summary to show for it.");
+    }
     /* The voice relays the report whole; the body stays the display copy. */
     complete = rendered.complete;
     if (destination) {
@@ -3575,6 +3586,7 @@ async function bridgeReport(
     covers,
     coversOwed,
     telegram: telegramCopy,
+    outcome,
   });
 
   /* A replay under the same key appends nothing, and says so rather than pretending
