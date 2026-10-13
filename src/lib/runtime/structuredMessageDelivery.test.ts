@@ -2,7 +2,8 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { afterAll, expect, test } from "bun:test";
+import { afterAll, expect, spyOn, test } from "bun:test";
+import { statePath } from "@/lib/configDir";
 
 import { AgentRegistry } from "@/lib/agent/registry";
 import { RuntimeJournal } from "@/runtime-host/journal";
@@ -136,6 +137,34 @@ function snapshot(ownedConversationId = conversationId, engine: "codex" | "claud
     deployments: [],
   };
 }
+
+test("image storage scans outside the account lease and rechecks a racing reservation", async () => {
+  const { registry, conversation } = registryWithConversation("default", "claude");
+  const images = new RuntimeImageStore(path.join(sandbox, "race-runtime-images"), { procSelfFdPaths: false });
+  const scans: boolean[] = [];
+  let raced = false;
+  const read = fs.readdirSync;
+  const scan = spyOn(fs, "readdirSync").mockImplementation(((...args: Parameters<typeof fs.readdirSync>) => {
+    if (String(args[0]).includes("runtime-images")) {
+      scans.push(fs.existsSync(statePath("account-selection.lock")));
+      if (!raced) {
+        raced = true;
+        registry.holdDelivery(conversation.id, "Racing payload", "image-scan-race");
+      }
+    }
+    return read(...args);
+  }) as typeof fs.readdirSync);
+  try {
+    const result = await enqueueStructuredMessage({ path: artifactPath, conversationId: conversation.id,
+      clientMessageId: "image-scan-race", text: "", images: [{ base64: PNG_BASE64, mime: "image/png" }],
+    }, { enabled: () => true, registry: () => registry, kick: () => {}, storeImages: uploads => images.putMany(uploads),
+      client: () => ({ readSession: sessionReader(async () => snapshot(conversation.id, "claude", true)) }) as RuntimeHostClient });
+    expect(result).toMatchObject({ ok: false, status: 409 });
+    expect(scans.length).toBeGreaterThan(0);
+    expect(scans).not.toContain(true);
+    expect(Object.values(registry.readOnlySnapshot().heldDeliveries).filter(row => row.clientMessageId === "image-scan-race")).toHaveLength(1);
+  } finally { scan.mockRestore(); registry.close(); }
+});
 
 test("Claude image-only admission stores refs and journals their content digest", async () => {
   const { registry, conversation } = registryWithConversation("default", "claude");
@@ -538,7 +567,7 @@ test("a spawn publication survives a later deduplicated admission conflict", asy
   expect(store.read(spawnRef!)).toEqual(Buffer.from(PNG_BASE64, "base64"));
 });
 
-test("cross-process image admission fences publication through durable reservation", async () => {
+test("cross-process image publication leaves admission runnable and retains both winning payloads", async () => {
   const stateRoot = fs.mkdtempSync(path.join(sandbox, "cross-process-admission-"));
   const registry = new AgentRegistry(
     path.join(stateRoot, "agent-registry.json"),
@@ -587,14 +616,14 @@ test("cross-process image admission fences publication through durable reservati
       await Bun.sleep(10);
     }
   };
-  const finish = async (process: ReturnType<typeof child>): Promise<string> => {
+  const finish = async (process: ReturnType<typeof child>) => {
     const [exitCode, stdout, stderr] = await Promise.all([
       process.exited,
       new Response(process.stdout).text(),
       new Response(process.stderr).text(),
     ]);
     if (exitCode !== 0) throw new Error(stderr || `structured image admission writer exited ${exitCode}`);
-    return stdout;
+    return JSON.parse(stdout);
   };
 
   const writerA = child("admission-a", PNG_BASE64, aPublished, aRelease);
@@ -602,30 +631,18 @@ test("cross-process image admission fences publication through durable reservati
   let writerB: ReturnType<typeof child> | null = null;
   try {
     await waitForFile(aPublished);
+    expect(JSON.parse(fs.readFileSync(aPublished, "utf8"))).toEqual({ accountLeaseHeld: false });
     writerC = child("admission-b", PNG_BASE64, cPublished, cRelease);
-    await Bun.sleep(40);
+    await waitForFile(cPublished);
+    expect(JSON.parse(fs.readFileSync(cPublished, "utf8"))).toEqual({ accountLeaseHeld: false });
     writerB = child("admission-b", SECOND_PNG_BASE64);
-    await Bun.sleep(150);
-    const crossedPublicationFence = fs.existsSync(cPublished);
-
-    if (crossedPublicationFence) {
-      await finish(writerB);
-      fs.writeFileSync(cRelease, "release\n");
-      await finish(writerC);
-      fs.writeFileSync(aRelease, "release\n");
-      await finish(writerA);
-    } else {
-      fs.writeFileSync(aRelease, "release\n");
-      await finish(writerA);
-      const cPublishedBeforeExit = await Promise.race([
-        waitForFile(cPublished).then(() => true),
-        writerC.exited.then(() => false),
-      ]);
-      if (cPublishedBeforeExit) fs.writeFileSync(cRelease, "release\n");
-      await Promise.all([finish(writerC), finish(writerB)]);
-    }
-
-    expect(crossedPublicationFence).toBe(false);
+    expect(await finish(writerB)).toMatchObject({ ok: true, outcome: "queued" });
+    // Both publications remain paused. The conflicting request reserves its
+    // own bytes first; the losing request must preserve the shared first blob.
+    fs.writeFileSync(cRelease, "release\n");
+    expect(await finish(writerC)).toMatchObject({ ok: false, status: 409, error: "client message id is already reserved for another request" });
+    fs.writeFileSync(aRelease, "release\n");
+    expect(await finish(writerA)).toMatchObject({ ok: true, outcome: "queued" });
     const persisted = new AgentRegistry(
       path.join(stateRoot, "agent-registry.json"),
       undefined,
@@ -635,16 +652,22 @@ test("cross-process image admission fences publication through durable reservati
     const reservation = Object.values(persisted.heldDeliveries)
       .find((delivery) => delivery.clientMessageId === "admission-a");
     expect(reservation?.runtimeImages).toHaveLength(1);
+    const otherReservation = Object.values(persisted.heldDeliveries)
+      .find((delivery) => delivery.clientMessageId === "admission-b");
+    expect(otherReservation?.runtimeImages).toHaveLength(1);
+    expect(Object.keys(persisted.heldDeliveries)).toHaveLength(2);
     const store = new RuntimeImageStore(path.join(stateRoot, "runtime-images"));
     expect(store.read(reservation!.runtimeImages[0]!)).toEqual(Buffer.from(PNG_BASE64, "base64"));
+    expect(store.read(otherReservation!.runtimeImages[0]!)).toEqual(Buffer.from(SECOND_PNG_BASE64, "base64"));
   } finally {
     fs.writeFileSync(aRelease, "release\n");
     fs.writeFileSync(cRelease, "release\n");
     for (const process of [writerA, writerC, writerB]) {
       if (process && process.exitCode === null) process.kill();
     }
+    await Promise.all([writerA, writerC, writerB].map(process => process?.exited));
   }
-});
+}, 15_000);
 
 test("one UTF-8 envelope bound rejects an oversized multibyte caption before storage, recovery, and reservation", async () => {
   const { registry, conversation } = registryWithConversation("default", "claude");
@@ -3196,15 +3219,15 @@ test("an injection a switch overtook between preflight and its reservation is re
       recordStructuredOwner(registry, conversation);
       const progress = new DeliveryProgressStore(null);
       let commands = 0;
-      const originalHold = registry.holdDeliveryOffLoop.bind(registry);
-      registry.holdDeliveryOffLoop = (async (...args: Parameters<AgentRegistry["holdDeliveryOffLoop"]>) => {
+      const originalHold = registry.accountMutationWrite.bind(registry);
+      registry.accountMutationWrite = (async (...args: Parameters<AgentRegistry["accountMutationWrite"]>) => {
         /* The switch lands between the preflight and the reservation. */
         registry.commitMigrationIntent({ engine: "codex", targetId: "b", origin: "manual", requestId: "inject-race",
           expectedRevision: registry.engineRouting("codex").revision });
         const held = await originalHold(...args);
         if (lockHeldMs > 0) await holder.hold(lockHeldMs);
         return held;
-      }) as AgentRegistry["holdDeliveryOffLoop"];
+      }) as AgentRegistry["accountMutationWrite"];
       let duringEnding: ReturnType<DeliveryProgressStore["get"]> | undefined;
       const originalWrite = registry.deliveryWrite.bind(registry);
       registry.deliveryWrite = ((correlation: { label: string; operationId?: string | null }, write: () => unknown, correlate?: never) => {

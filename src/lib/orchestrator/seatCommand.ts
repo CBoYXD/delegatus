@@ -33,6 +33,7 @@ import { derivedSpawnTitle } from "@/lib/title";
 import { telegramSetUp } from "@/lib/telegram/launchReadiness";
 import { activeDrain } from "@/lib/selfUpdate/drain";
 import { launchHoldRefusal } from "@/lib/selfUpdate/launchHold";
+import { captureSeatAuthCredentialBaseline } from "@/lib/accounts/seatAuthCredentials";
 import { automaticReplacementHold } from "./seatTurnFence";
 
 import {
@@ -68,7 +69,7 @@ import {
   orchestratorRevocations,
   orchestratorSeatFor,
   repairOrchestratorSeatRuntimeIdentity,
-  recordOrchestratorSeatAuthCredentialBaseline,
+  prepareOrchestratorSeatAuthCredentialBaseline,
   type OrchestratorSeat,
   type OrchestratorSeatTerminalization,
   type StillbornSeatRollback,
@@ -113,6 +114,9 @@ export interface SeatLaunchAdmission {
   autonomous?: boolean;
   automaticReplacement?: { conversationId: string; seatEpoch: number };
   assertAccount?(accountId: string): void;
+  /** Slow evidence collection runs before the spawn lease; only the returned
+      commit runs inside its revalidated account admission guard. */
+  prepareAccount?(accountId: string): (() => void) | Promise<() => void>;
   /** Automatic rotation's fresh turn fence. Checked before handoff work and
    * after reconciliation, immediately before admitting a replacement. */
   replacementHold?(): SeatCommandResult | null | Promise<SeatCommandResult | null>;
@@ -282,7 +286,8 @@ async function postSpawnInProcess(body: Record<string, unknown>, autonomous = fa
   } as unknown as NextRequest;
   const response = await executeSpawnRequest(request, { ...productionSpawnCommandDependencies,
     autonomousAdmissionHeld: () => autonomous && !!activeDrain(),
-    assertAccountAdmission: admission?.assertAccount });
+    assertAccountAdmission: admission?.assertAccount,
+    prepareAccountAdmission: admission?.prepareAccount });
   return { status: response.status, body: await response.json() as Record<string, unknown> };
 }
 
@@ -519,15 +524,25 @@ async function activate(
   dependencies: SeatCommandDependencies,
   admission?: SeatLaunchAdmission,
 ): Promise<{ seat: OrchestratorSeat; hold?: never } | { hold: SeatCommandResult; seat?: never } | null> {
-  let projectedSeat: OrchestratorSeat | null = null;
   let refused: SeatCommandResult | null = null;
   /* Activation follows an await (the spawn, the delivery), so nothing here
      depends on staying synchronous, and by now a launch may already be running
      for this intent. It therefore queues for the lock instead of asking once:
      a writer that holds it for a few milliseconds must not cost the project
      the seat its launch was accepted for. */
-  const completed = await withAccountMutationLockAsync(async () => {
+  const observed = orchestratorSeatFor(input.project);
+  const observedPending = observed.pending?.intent.clientRequestId === input.clientRequestId ? observed.pending : null;
+  const observedFence = observedPending?.intent.automaticReplacement;
+  const turnEvidence = observedFence ? JSON.stringify(agentRegistry().conversationDeliverySnapshot({ conversationId: observedFence.conversationId })) : null;
+  const preparedAuthCredentialBaseline = observedPending && !observedPending.authCredentialBaseline
+    ? captureSeatAuthCredentialBaseline(observedPending.engine ?? input.engine, input.path, `seat-auth-baseline:${input.project}:${observedPending.seatEpoch}`) ?? null : null;
+  const hold = observedPending
+    ? await (admission?.replacementHold ? admission.replacementHold()
+      : observedFence ? (dependencies.automaticReplacementHold ?? productionSeatCommandDependencies.automaticReplacementHold!)(observedFence.conversationId) : null)
+    : null;
+  const completed = await withAccountMutationLockAsync(() => {
     const snapshot = orchestratorSeatFor(input.project);
+    if (JSON.stringify(snapshot) !== JSON.stringify(observed)) return { kind: "missing" } as const;
     const pending = snapshot.pending?.intent.clientRequestId === input.clientRequestId ? snapshot.pending : null;
     const fence = pending?.intent.automaticReplacement;
     if (fence && (snapshot.active?.seatEpoch !== fence.seatEpoch || snapshot.active?.conversationId !== fence.conversationId)) {
@@ -536,12 +551,7 @@ async function activate(
       refused = { status: 409, body: { code: "incumbent_changed", error } };
       return { kind: "missing" } as const;
     }
-    const replacementCheck = pending
-      ? admission?.replacementHold ? admission.replacementHold()
-        : fence ? (dependencies.automaticReplacementHold ?? productionSeatCommandDependencies.automaticReplacementHold!)(fence.conversationId) : null
-      : null;
-    const hold = replacementCheck instanceof Promise ? await replacementCheck : replacementCheck;
-    if (hold) {
+    if (hold || observedFence && turnEvidence !== JSON.stringify(agentRegistry().conversationDeliverySnapshot({ conversationId: observedFence.conversationId }))) {
       // The launch has already been admitted. Terminalize its seat intent so
       // reconciliation cannot revoke a predecessor that started another turn.
       const error = "automatic replacement refused because the incumbent turn became busy or unknown after successor launch";
@@ -558,13 +568,13 @@ async function activate(
       engine: input.engine,
       model: input.model,
       now: dependencies.now(),
+      preparedAuthCredentialBaseline,
     });
-    if (result.kind !== "missing") projectedSeat = reconcileAuthorityProjections(result.seat, dependencies);
     return result;
   }, { holder: "orchestrator seat activation", waitMs: dependencies.seatStoreWaitMs ?? SEAT_STORE_WAIT_MS });
   if (refused) return { hold: refused };
   if (completed.kind === "missing") return null;
-  const seat: OrchestratorSeat = projectedSeat ?? completed.seat;
+  const seat: OrchestratorSeat = reconcileAuthorityProjections(completed.seat, dependencies);
   /* Once per new seat epoch — a fresh seat, an adopted conversation, a
      rotation — whatever produced it; the report's own claim makes a second
      activation of the same epoch a no-op. Never awaited, so the seat command
@@ -587,14 +597,20 @@ function reconcileAuthorityProjections(
   const durableRuntime = seat.engine && seat.model
     ? { engine: null, model: null }
     : dependencies.runtimeIdentity(seat.conversationId);
-  const repaired = repairOrchestratorSeatRuntimeIdentity({
-    project: seat.project,
-    conversationId: seat.conversationId,
-    engine: durableRuntime.engine,
-    model: durableRuntime.model,
-  }) ?? seat;
-  dependencies.stampRegistryIdentity(repaired);
-  return repaired;
+  return withAccountMutationLock(() => {
+    const current = orchestratorSeatFor(seat.project).active;
+    if (current?.seatEpoch !== seat.seatEpoch || current.conversationId !== seat.conversationId) {
+      throw new Error("orchestrator seat changed before identity publication");
+    }
+    const repaired = repairOrchestratorSeatRuntimeIdentity({
+      project: seat.project,
+      conversationId: seat.conversationId!,
+      engine: durableRuntime.engine,
+      model: durableRuntime.model,
+    }) ?? current;
+    dependencies.stampRegistryIdentity(repaired);
+    return repaired;
+  });
 }
 
 function reconcileCompletedSeatReplay(
@@ -602,11 +618,9 @@ function reconcileCompletedSeatReplay(
   clientRequestId: string,
   dependencies: SeatCommandDependencies,
 ): OrchestratorSeat | null {
-  return withAccountMutationLock(() => {
-    const seat = orchestratorSeatFor(project).active;
-    if (!seat || seat.intent.clientRequestId !== clientRequestId) return null;
-    return reconcileAuthorityProjections(seat, dependencies);
-  });
+  const seat = orchestratorSeatFor(project).active;
+  if (!seat || seat.intent.clientRequestId !== clientRequestId) return null;
+  return reconcileAuthorityProjections(seat, dependencies);
 }
 
 /**
@@ -1310,9 +1324,10 @@ async function runOrchestratorSeatRequest(
     title: derivedSpawnTitle("orchestrator", spawnMandate, project),
     clientAttemptId: clientRequestId,
   };
-  const spawnAdmission: SeatLaunchAdmission = { ...admission, assertAccount: (accountId) => {
-    admission?.assertAccount?.(accountId);
-    recordOrchestratorSeatAuthCredentialBaseline(project, clientRequestId, begun.seat.seatEpoch, launchEngine, accountId);
+  const spawnAdmission: SeatLaunchAdmission = { ...admission, prepareAccount: async (accountId) => {
+    const commitCaller = await admission?.prepareAccount?.(accountId);
+    const commitBaseline = prepareOrchestratorSeatAuthCredentialBaseline(project, clientRequestId, begun.seat.seatEpoch, launchEngine, accountId);
+    return () => { commitCaller?.(); commitBaseline(); };
   } };
   const spawned = await dependencies.spawn(spawnBody, admission?.autonomous || begun.seat.triggeredBy?.kind === "agent", spawnAdmission);
   if (spawned.body.code === "AUTO_UPDATE_DRAIN") {

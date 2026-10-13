@@ -21,6 +21,58 @@ replays within 10 s. These waits yield. No provider probe, fork, delivery,
 withdrawal socket call, digest calculation or handoff summarizer moved under
 the lock.
 
+The body audit in #1935 extends this admission policy to work performed after
+acquisition. Credential and transcript discovery, login child I/O, RPC,
+provider-home preparation, recursive archive scans and image publication run
+outside the shared lease. Commits reread the protected account, binding, seat,
+login or registry evidence before writing. Provider engine guards serialize
+home preparation before account admission and refuse a live competing owner.
+A contended state or registry writer never sleeps while holding the account
+lease. Spawn/resume/send retry writer acquisition outside it and repeat their
+admission guards; generic account callbacks are never replayed automatically.
+The legacy JSON routing setter retains its synchronous writer wait before
+account admission. The complete 101-body inventory, before/after timings and
+stimulus paths are recorded in
+[`evidence/account-mutation-lock/bodies.json`](../../evidence/account-mutation-lock/bodies.json).
+
+Review corrections on 2026-10-13 extend the writer probe to the JSON lock in
+`off` and `dual-write` modes. Admission acquires that writer before calling a
+mutation, lends the claim to its synchronous writes, and releases it before
+any bounded retry delay. Guard changes and deadline exhaustion run no mutation;
+an exception after a write propagates without replaying the callback.
+`accountMutation.writer.test.ts` reproduces six spawn/resume/send failures on
+the reviewed head and passes those cases after the correction. Its isolated
+contention fixtures measured account lease holds below 16 ms after the fix.
+
+Claude Main removal also rereads durable login rows inside its short commit
+lease before retiring routing or hiding Main. In the separate-process regression
+in `src/app/api/accounts/claude/route.test.ts`, DELETE pauses after its initial
+blocker read while POST accepts a retry. DELETE then returns 409 with
+`login_pending`, Main stays visible, and routing and project bindings retain
+their prior values. The preparation barrier holds no account lease.
+
+The cross-process image test now coordinates publication with explicit markers
+instead of timing child startup. Its previous assertion required unrelated
+publication to wait behind the account lease, which conflicts with this body
+split. The replacement pauses two publishers outside that lease, lets a
+conflicting payload reserve first, and checks the losing request returns 409
+while both winning reservations retain their exact image bytes.
+
+The seat credential baseline also prepares before spawn's outer account lease.
+`SeatLaunchAdmission.prepareAccount` reaches the spawn command through its
+in-process port and returns a short commit. The guard rechecks the account
+revision and credential-file identity before that commit compares the pending
+request and seat epoch. Existing account authorization still runs in the guard;
+receipt replays reuse their accepted launch and skip preparation.
+The integrated `spawnCommand.contention.test.ts` case exercises the production
+seat callback while a separate process attempts spawn, resume and send on their
+normal 2 s budgets. All three failed on the reviewed commit and succeed after
+the split. Three runs measured maximum leases of 2062 to 2080 ms before and
+13 to 17 ms after, with baseline commits of 0.686 to 1.055 ms after. These fixtures
+simulate credential capture; row 35 of the inventory retains the exact samples
+and the earlier direct-call observation. Catalog and credential-file races
+also refuse before committing a baseline or launch receipt.
+
 | Caller | File:line | Foreign holder | Why | Local holder or local waiter |
 | --- | --- | --- | --- | --- |
 | `runIdentityWaveMigrationAtStartup` | `src/lib/agent/identityWaveStartup.ts:196` | 25 ms wait | Boot needs a completed migration result; rerunning the outer startup later remains idempotent. | The Viewer startup wrapper (`src/lib/viewerInstrumentation.ts:573`) yields and retries up to three total attempts, with 5 s and 10 s pauses by default. Exhaustion logs diagnostics and leaves the migration for a later startup. The direct synchronous API raises safe AccountMutationBusyError. |
@@ -46,7 +98,7 @@ the lock.
 | `ManagedCodexRuntime.record` | `src/lib/accounts/codexRuntime.ts:458` | 25 ms wait; existing queued replay | A short holder permits synchronous persistence; longer/local contention keeps the existing coalesced queue. | Existing coalesced async persistence queue replays latest records; client completion/cleanup continues while the holder remains runnable. |
 | `withRegistryLock` | `src/lib/accounts/claude.ts:283` | 25 ms wait | Catalog operations synchronously return their committed account record. | Async manager admission and `/api/accounts/claude` provider edit/create and orphan cleanup queue each catalog commit (2 s); exhausted admission returns 503 `account_store_busy`. Provider model reads stay outside the lock. Direct catalog API raises safe AccountMutationBusyError without returning a committed account; retry after yielding. |
 | `setActiveClaudeAccount` | `src/lib/accounts/claude.ts:325` | 25 ms wait | Selection must commit before its caller proceeds. | Async manager selection and compatibility routing queue. Direct sync API raises safe AccountMutationBusyError before selection changes. |
-| `withRegistryLock` | `src/lib/accounts/codex.ts:297` | 25 ms wait | Catalog operations synchronously return their committed account record. | Async manager admission and `/api/accounts/codex` creation/orphan cleanup queue each catalog commit (2 s); exhausted admission returns 503 `account_store_busy`. Device login starts after the catalog lease releases. Direct catalog API raises safe AccountMutationBusyError without returning a committed account; retry after yielding. |
+| `withRegistryLock` | `src/lib/accounts/codex.ts:297` | 25 ms wait | Catalog operations synchronously return their committed account record. | HTTP creation/orphan cleanup first await preparation admission (2 s); preparation runs outside the lease and each catalog commit revalidates current state. Exhausted admission returns 503 `account_store_busy`. Manager creation waits before preparation and delegates to the provider commit. Device login starts after the catalog lease releases. Direct catalog API raises safe AccountMutationBusyError without returning a committed account; retry after yielding. |
 | `setActiveCodexAccount` | `src/lib/accounts/codex.ts:472` | 25 ms wait | Selection must commit before its caller proceeds. | Async manager selection and compatibility routing queue. Direct sync API raises safe AccountMutationBusyError before selection changes. |
 | `setActiveCopilotAccount` | `src/lib/accounts/copilot.ts:173` | 25 ms wait | Selection must commit before its caller proceeds. | `/api/accounts/copilot` selection queues the commit (2 s); exhausted admission returns 503 `account_store_busy` with the safe sentence. Direct sync API raises safe AccountMutationBusyError before selection changes. |
 | `createManagedCopilotAccount` | `src/lib/accounts/copilot.ts:184` | 25 ms wait | Creation must return the account that was durably added. | `/api/accounts/copilot` creation queues the commit (2 s); exhausted admission returns 503 `account_store_busy` with the safe sentence. Direct sync API raises safe AccountMutationBusyError without adding an account. |

@@ -2543,7 +2543,7 @@ export class SqliteAgentRegistryStore {
     }
   }
 
-  mutate<T>(operation: (file: RegistryFile) => T, includeSnapshot = true, options: { operationName?: string } = {}): SqliteRegistryMutation<T> {
+  mutate<T>(operation: (file: RegistryFile) => T, includeSnapshot = true, options: { operationName?: string; noWait?: boolean } = {}): SqliteRegistryMutation<T> {
     let operationName = options.operationName ?? operation.name;
     /* {@link withWriter} already opened the write transaction for this call. */
     const writerHeld = this.writerHeld;
@@ -2552,7 +2552,7 @@ export class SqliteAgentRegistryStore {
       const pessimistic = attempt > 1 || writerHeld;
       const waitStartedAt = performance.now();
       if (writerHeld) { /* the lock is held and the transaction is open */ }
-      else if (pessimistic) this.beginMutationWrite();
+      else if (pessimistic) this.beginMutationWrite(options.noWait);
       else this.db.exec("BEGIN");
       let current: LazyRegistrySnapshot;
       let changes: RegistryChanges;
@@ -2568,7 +2568,7 @@ export class SqliteAgentRegistryStore {
         throw error;
       }
       const optimisticWaitStartedAt = performance.now();
-      if (!pessimistic) this.beginMutationWrite();
+      if (!pessimistic) this.beginMutationWrite(options.noWait);
       let revision: number;
       let stamps = { before: "", after: "" };
       const changed = changes.rows.size > 0 || changes.meta.size > 0 || changes.order.size > 0;
@@ -2702,10 +2702,10 @@ export class SqliteAgentRegistryStore {
    * caller's correlation. For writes made inside another synchronous lock,
    * where neither a spin nor an `await` is safe.
    */
-  tryWriter<T>(operation: () => T): { acquired: true; value: T } | { acquired: false } {
+  tryWriter<T>(operation: () => T, options: { recordRefusal?: boolean } = {}): { acquired: true; value: T } | { acquired: false } {
     const startedAt = performance.now();
     if (!this.tryBeginWrite()) {
-      recordBlockingWait({ site: "registry-lock-async", durationMs: performance.now() - startedAt, synchronous: false, subject: "agent-registry", refused: true });
+      if (options.recordRefusal !== false) recordBlockingWait({ site: "registry-lock-async", durationMs: performance.now() - startedAt, synchronous: false, subject: "agent-registry", refused: true });
       return { acquired: false };
     }
     this.writerHeld = true;
@@ -2733,7 +2733,13 @@ export class SqliteAgentRegistryStore {
     }
   }
 
-  private beginMutationWrite(): void {
+  private beginMutationWrite(noWait = false): void {
+    if (noWait) {
+      this.db.exec("PRAGMA busy_timeout = 0");
+      try { this.db.exec("BEGIN IMMEDIATE"); }
+      finally { this.db.exec("PRAGMA busy_timeout = 5000"); }
+      return;
+    }
     const deadline = this.writerClock() + 5_000;
     // SQLite's default busy handler grows its sleep to 100 ms. Short registry
     // commits can repeatedly pass a sleeping lane. Retry acquisition in short
@@ -2755,14 +2761,15 @@ export class SqliteAgentRegistryStore {
     }
   }
 
-  replace(file: RegistryFile, expectedRevision?: number): SqliteRegistryReplacement {
+  replace(file: RegistryFile, expectedRevision?: number, options: { noWait?: boolean } = {}): SqliteRegistryReplacement {
     /* A wholesale replacement is a mutation like any other, and its payload
        arrives from outside this store, so it is re-decided before it lands
        rather than on the way back out (#739). `persistDiff` takes only a
        DecidedRegistryFile, so this line cannot be dropped without the store
        failing to compile. */
     const decided = this.decideAssembled(file);
-    this.db.exec("BEGIN IMMEDIATE");
+    if (options.noWait) this.beginMutationWrite(true);
+    else this.db.exec("BEGIN IMMEDIATE");
     try {
       const current = this.loadInTransaction();
       if (expectedRevision !== undefined && current.revision !== expectedRevision) {

@@ -11,7 +11,6 @@ import {
   type RegistryConversation,
 } from "@/lib/agent/registry";
 import { structuredHostsEnabled } from "./flags";
-import { withAccountMutationLockAsync } from "@/lib/accounts/accountMutation";
 import { readRetiredAccountIds } from "@/lib/accounts/accountsStore";
 import type { AgentEngine } from "@/lib/agent/cli";
 import { deliveryFence } from "@/lib/accounts/migration/coordinator";
@@ -653,20 +652,18 @@ async function holdDuringRuntimeSynchronization(
       : null;
     const reservation = await withAdmissionSection(admissionKey, async () => {
       if (rawImages.length === 0) return place();
-      return (admission.withImageAdmissionLock ?? withAccountMutationLockAsync)(async () => {
-        const raced = registry.preflightDeliveryReservation(
-          conversation.id,
-          deliveryText,
-          idempotencyKey,
-          payloadKind,
-          refs,
-          contentDigest,
-          commandInput(request),
-        );
-        if (raced) return raced;
-        (admission.storeImages ?? ((images) => runtimeImageStore().putMany(images)))(rawImages);
-        return place();
-      });
+      const raced = registry.preflightDeliveryReservation(
+        conversation.id,
+        deliveryText,
+        idempotencyKey,
+        payloadKind,
+        refs,
+        contentDigest,
+        commandInput(request),
+      );
+      if (raced) return raced;
+      (admission.storeImages ?? ((images) => runtimeImageStore().putMany(images)))(rawImages);
+      return admission.withImageAdmissionLock ? admission.withImageAdmissionLock(place) : place();
     });
     if (reservation.state === "delivered") {
       return deliveredReservationReplay(reservation, idempotencyKey, conversation.id, false);
@@ -1475,32 +1472,32 @@ export async function enqueueStructuredMessage(
      under the same content address. */
   let publishedImages = false;
   const admitDurably = () => withAdmissionSection(admissionKey, async () => {
-    const admit = async (): Promise<HeldDelivery> => {
-      const replay = registry.preflightDeliveryReservation(
-        conversation.id,
-        content.content.text,
-        idempotencyKey,
-        refs.length ? "runtime-images" : "text",
-        refs,
-        content.contentDigest,
-        commandInput(request),
-      );
-      if (replay) return replay;
-      if (request.admissionGuard
-        && registry.deliveryAdmissionForKey(conversation.id, idempotencyKey).outcome !== "admitted") request.admissionGuard();
-      if (rawImages.length > 0 && !publishedImages) {
-        (dependencies.storeImages ?? ((images) => runtimeImageStore().putMany(images)))(rawImages);
-        publishedImages = true;
-      }
-      /* A reservation race can follow publication when another process runs
-         older code or when a structured spawn published the same digest.
-         The grace-period collector owns orphan cleanup. Synchronous removal
-         cannot distinguish this admission's blob from a deduplicated blob
-         whose durable reservation is still pending.
+    const replay = registry.preflightDeliveryReservation(
+      conversation.id,
+      content.content.text,
+      idempotencyKey,
+      refs.length ? "runtime-images" : "text",
+      refs,
+      content.contentDigest,
+      commandInput(request),
+    );
+    if (replay) return replay;
+    if (request.admissionGuard
+      && registry.deliveryAdmissionForKey(conversation.id, idempotencyKey).outcome !== "admitted") request.admissionGuard();
+    if (rawImages.length > 0 && !publishedImages) {
+      (dependencies.storeImages ?? ((images) => runtimeImageStore().putMany(images)))(rawImages);
+      publishedImages = true;
+    }
+    /* A reservation race can follow publication when another process runs
+       older code or when a structured spawn published the same digest.
+       The grace-period collector owns orphan cleanup. Synchronous removal
+       cannot distinguish this admission's blob from a deduplicated blob
+       whose durable reservation is still pending.
 
-         The write lock is waited for off the event loop and kept for the
-         write (incident 2026-10-06); one another writer keeps past its
-         deadline reserves nothing and refuses the send. */
+       The write lock is waited for off the event loop and kept for the
+       write (incident 2026-10-06); one another writer keeps past its
+       deadline reserves nothing and refuses the send. */
+    const admit = async (): Promise<HeldDelivery> => {
       const held = await registry.holdDeliveryOffLoop(
         conversation.id,
         content.content.text,
@@ -1515,9 +1512,7 @@ export async function enqueueStructuredMessage(
       if (!held) throw new Error(REGISTRY_WRITER_BUSY);
       return held;
     };
-    if (rawImages.length === 0) return withAccountMutationLockAsync(admit, { holder: "send admission", caller: "send admission" });
-    return (dependencies.withImageAdmissionLock
-      ?? ((operation) => withAccountMutationLockAsync(operation, { holder: "image send admission", caller: "send" })))(admit);
+    return rawImages.length && dependencies.withImageAdmissionLock ? dependencies.withImageAdmissionLock(admit) : admit();
   });
   let reseatReservation: HeldDelivery | null = null;
   /* Reserve the send and request its active-account reseat in one mutation
