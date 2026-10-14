@@ -499,6 +499,10 @@ async function closeOverlays() {
   if (accountsClose) {
     accountsClose.click();
     await waitFor(() => !accountsDialog());
+    /* Closing hands focus back to the rail row that opened the flyout; the
+       next view starts without that ring. */
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()));
+    (document.activeElement as HTMLElement | null)?.blur();
   }
 }
 /** The send control's hint stays up while the pointer or focus rests on it;
@@ -584,6 +588,8 @@ async function navigateView(view: string) {
   if (view === "fold") return;
   if (view === "pipeline" || view === "decision") {
     const card = view === "decision" || step < 2 ? "t-retries" : "t-refunds";
+    /* A card is closed by default (#2800): its lane row, and the Stages opener in it, show once it is open. */
+    document.querySelector<HTMLElement>(`.card[data-id="task:${card}"] .icon-btn.fold[aria-expanded="false"]`)?.click();
     await press(() => document.querySelector<HTMLElement>(`.card[data-id="task:${card}"] [data-open-stages]`));
     return;
   }
@@ -720,6 +726,10 @@ html .kb .agent-window { top: 0; left: 0; width: 100vw; height: 100vh; border-ra
    its tail cuts a line at its top edge, so the top of every transcript fades
    in instead of ending on half a line. */
 [data-log-feed-scroller] { -webkit-mask-image: linear-gradient(to bottom, transparent 0, transparent 6px, #000 34px); mask-image: linear-gradient(to bottom, transparent 0, transparent 6px, #000 34px); }
+/* A frame holds a few short transcripts, so every row stays laid out. Under
+   content-visibility: auto the rows of a scaled frame stayed skipped (a 44 px
+   placeholder, no text) after the page scrolled away and back. */
+.feed-cv { content-visibility: visible; }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; } }`;
 document.head.appendChild(frameFill);
 
