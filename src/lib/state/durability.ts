@@ -843,14 +843,17 @@ export function backupsDue(stateDirectory: string, lastRevisions: ReadonlyMap<st
 export interface BackupWorkerRequest {
   stateDirectory: string;
   lastRevisions: [string, string][];
+  operation?: "activation";
 }
 
 export interface BackupWorkerResponse {
   outcomes: [string, BackupOutcome][];
+  incidents?: StorageIncident[];
 }
 
 /** The worker's side: one pass over the request, answered as one JSON line. */
 export function answerBackupWorkerRequest(request: BackupWorkerRequest): BackupWorkerResponse {
+  if (request.operation === "activation") return { outcomes: [], incidents: checkStateDatabasesAtActivation(request.stateDirectory) };
   const outcomes = runBackupPass(request.stateDirectory, new Map(request.lastRevisions));
   return { outcomes: [...outcomes] };
 }
@@ -880,6 +883,27 @@ export async function runBackupPassInWorker(
   lastRevisions: Map<string, string>,
   options: { launch?: { executable: string; workerPath: string } } = {},
 ): Promise<Map<string, BackupOutcome>> {
+  const response = await runDurabilityWorker({ stateDirectory, lastRevisions: [...lastRevisions] }, options);
+  const outcomes = new Map(response.outcomes);
+  for (const [name, outcome] of outcomes) {
+    if (outcome.state === "taken" || outcome.state === "unchanged") lastRevisions.set(name, outcome.revision);
+  }
+  return outcomes;
+}
+
+/** Activation awaits the same recovery decisions, with SQLite work off-thread. */
+export async function checkStateDatabasesInWorker(stateDirectory: string): Promise<StorageIncident[]> {
+  assertStateStartupMutation(stateDirectory, "state database activation check");
+  const response = await runDurabilityWorker({ stateDirectory, lastRevisions: [], operation: "activation" });
+  if (!Array.isArray(response.incidents)) throw new Error("the activation worker returned no incidents result");
+  return response.incidents;
+}
+
+async function runDurabilityWorker(
+  request: BackupWorkerRequest,
+  options: { launch?: { executable: string; workerPath: string } } = {},
+): Promise<BackupWorkerResponse> {
+  const { stateDirectory } = request;
   const launch = options.launch ?? stateBackupWorkerLaunch();
   const { endLeasedHelper, leasedHelperInput, spawnLeasedHelper } = await import("@/lib/helperLease");
   const useNice = fs.existsSync("/usr/bin/nice");
@@ -892,12 +916,14 @@ export async function runBackupPassInWorker(
     env: process.env,
   }, stateDirectory, { input: true, stdout: "pipe", stderr: "inherit", followRelease: false });
   const input = leasedHelperInput(child);
-  const request: BackupWorkerRequest = { stateDirectory, lastRevisions: [...lastRevisions] };
   const response = await new Promise<BackupWorkerResponse>((resolve, reject) => {
     let output = "";
+    let timedOut = false;
     const timeout = setTimeout(() => {
+      timedOut = true;
       endLeasedHelper(child);
-      reject(new Error(`the backup worker ran past ${BACKUP_WORKER_TIMEOUT_MS} ms and was stopped`));
+      // Activation may open stores next; wait for the guardian to reap the
+      // worker before reporting its timeout, so recovery cannot race imports.
     }, BACKUP_WORKER_TIMEOUT_MS);
     timeout.unref?.();
     child.stdout!.setEncoding("utf8");
@@ -910,6 +936,7 @@ export async function runBackupPassInWorker(
     child.once("close", (code, signal) => {
       clearTimeout(timeout);
       try {
+        if (timedOut) throw new Error(`the backup worker ran past ${BACKUP_WORKER_TIMEOUT_MS} ms and was stopped`);
         if (code !== 0) throw new Error(`the backup worker exited with ${code ?? signal}`);
         resolve(JSON.parse(output.trim().split("\n").at(-1) ?? "") as BackupWorkerResponse);
       } catch (error) {
@@ -918,11 +945,7 @@ export async function runBackupPassInWorker(
     });
     input.end(JSON.stringify(request));
   });
-  const outcomes = new Map(response.outcomes);
-  for (const [name, outcome] of outcomes) {
-    if (outcome.state === "taken" || outcome.state === "unchanged") lastRevisions.set(name, outcome.revision);
-  }
-  return outcomes;
+  return response;
 }
 
 /** A `.partial` backup whose writer died mid-copy. */

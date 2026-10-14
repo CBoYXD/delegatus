@@ -837,13 +837,36 @@ export async function checkStateDatabasesBeforeStores(
   stateDirectory: string,
 ): Promise<{ start(ownsTraffic: () => boolean): void }> {
   try {
-    const { checkStateDatabasesAtActivation, startStateDurability } = await import("@/lib/state/durability");
-    const incidents = checkStateDatabasesAtActivation(stateDirectory);
+    const { checkStateDatabasesInWorker, startStateDurability } = await import("@/lib/state/durability");
+    const incidents = await checkStateDatabasesInWorker(stateDirectory);
     return { start: (ownsTraffic) => { startStateDurability({ stateDirectory, incidents, ownsTraffic }); } };
   } catch (error) {
     console.error("[state durability] activation check failed", error instanceof Error ? error.message : String(error));
     return { start: () => {} };
   }
+}
+
+/** Retirement waits for startup mutations already admitted, and a late result
+    cannot advance activation after its controller has aborted. */
+export function createViewerStartupBarrier(controller: AbortController) {
+  const pending = new Set<Promise<unknown>>();
+  return {
+    run<T>(work: () => Promise<T>): Promise<T> {
+      const operation = (async () => {
+        controller.signal.throwIfAborted();
+        const result = await work();
+        controller.signal.throwIfAborted();
+        return result;
+      })();
+      pending.add(operation);
+      void operation.then(() => pending.delete(operation), () => pending.delete(operation));
+      return operation;
+    },
+    async quiesce(reason: Error): Promise<void> {
+      controller.abort(reason);
+      await Promise.allSettled([...pending]);
+    },
+  };
 }
 
 /** The full node-runtime startup sequence `src/instrumentation.ts` defers to. */
@@ -892,10 +915,9 @@ export async function registerViewerRuntime(): Promise<void> {
   const releaseRevision = () => hotStateWriterRevision(hotStateDirectory);
   let activatedReleaseRevision: string | null = null;
   const startupAbort = new AbortController();
-  let startup: Promise<void> | null = null;
+  const startupBarrier = createViewerStartupBarrier(startupAbort);
   const quiesceStartup = async () => {
-    startupAbort.abort(new Error("structured startup retired by release handover"));
-    await startup?.catch(() => {});
+    await startupBarrier.quiesce(new Error("structured startup retired by release handover"));
   };
   const assertStartupActive = () => {
     // Observe durable retirement at every phase/batch boundary, including
@@ -918,7 +940,9 @@ export async function registerViewerRuntime(): Promise<void> {
     openStateMutationActivation();
     const boundary = await establishHotStateCutoverBoundary(isCurrent);
     activatedReleaseRevision = boundary.authority?.releaseRevision ?? null;
-    const durability = await checkStateDatabasesBeforeStores(hotStateDirectory);
+    assertStartupActive();
+    const durability = await startupBarrier.run(() => checkStateDatabasesBeforeStores(hotStateDirectory));
+    assertStartupActive();
     const { sweepOldLearnedRulesFiles } = await import("@/lib/memory/roleLaunch");
     try { sweepOldLearnedRulesFiles(); } catch { console.warn("[role-memory] old launch-file cleanup unavailable"); }
     const authority = await initializeHotStateStoresAtStartup(boundary);
@@ -941,13 +965,13 @@ export async function registerViewerRuntime(): Promise<void> {
       },
       startStructuredHosts: structuredHostsEnabled()
         ? () => {
-            startup = (async () => {
+            const startup = startupBarrier.run(async () => {
               const { adoptStructuredHostsAtStartup } = await import("@/lib/runtime/startup");
               await runStructuredHostStartup(
                 () => adoptStructuredHostsAtStartup({ assertActive: assertStartupActive }),
                 console.error, { waitUntilReady: true, signal: startupAbort.signal },
               );
-            })();
+            });
             void startup.catch((error) => console.error("[structured hosts] background startup aborted", error));
           }
         : null,
