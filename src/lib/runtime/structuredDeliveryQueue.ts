@@ -102,7 +102,7 @@ export interface StructuredDeliveryQueuePort {
       which is exactly when it has to be honoured. */
   settled?(operationId: string): boolean | Promise<boolean>;
   /** Synchronous live cutoff at the engine call, after all journal/health waits. */
-  authorizeDispatch?(operationId: string): void;
+  authorizeDispatch?(operationId: string, conversationId: string): void;
   /** Durable caller attribution for background queue diagnostics. */
   diagnosticError?(...args: unknown[]): void;
   /** The writer claim that currently owns this conversation's structured host —
@@ -2148,7 +2148,7 @@ export class StructuredDeliveryQueue {
       const authorize = () => {
         const retired = this.port.conversationRetired?.(effect.conversationId);
         if (retired) throw new StructuredSendRefusedError(retired);
-        this.port.authorizeDispatch?.(effect.operationId);
+        this.port.authorizeDispatch?.(effect.operationId, effect.conversationId);
       };
       try {
         if (this.port.handoffHeld?.()) {
