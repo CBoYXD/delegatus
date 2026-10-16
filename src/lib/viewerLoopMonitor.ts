@@ -11,6 +11,7 @@ export type ViewerOperation = "runtime.startup-row" | "controller.account-migrat
   | "runtime.rpc" | "runtime.delivery-list" | "runtime.delivery-wake"
   | "external-relay.owner-history"
   | "prototype.publish" | "prototype.copy" | "prototype.state" | "prototype.delivery" | "prototype.telegram"
+  | "codex.protocol-admission"
   | "pipelines.controller-job" | "pipelines.controller-lane" | "pipelines.controller-schedule"
   | "telegram.outbound-state" | "telegram.outbound-publication" | "orchestrator.recipient-authority";
 type Operation = { name: ViewerOperation; start: number; end?: number };
